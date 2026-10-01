@@ -374,13 +374,13 @@ static const char *exts[] = {XR_KHR_METAL_ENABLE_EXTENSION_NAME, XR_KHR_CONVERT_
                              XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME,
                              XR_EXT_LOCAL_FLOOR_EXTENSION_NAME, XR_FB_COLOR_SPACE_EXTENSION_NAME,
                              XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME,
-                             XR_EXT_PALM_POSE_EXTENSION_NAME, XR_EXT_DEBUG_UTILS_EXTENSION_NAME};
+                             XR_EXT_DEBUG_UTILS_EXTENSION_NAME};   // no XR_EXT_palm_pose: we only have grip/aim, and a fake palm (= grip) made OpenComposite rotate/shift the hands
 static const uint32_t extVer[] = {XR_KHR_metal_enable_SPEC_VERSION, XR_KHR_convert_timespec_time_SPEC_VERSION,
                                   XR_FB_display_refresh_rate_SPEC_VERSION, XR_KHR_composition_layer_depth_SPEC_VERSION,
                                   XR_KHR_composition_layer_cylinder_SPEC_VERSION, XR_KHR_visibility_mask_SPEC_VERSION,
                                   XR_EXT_local_floor_SPEC_VERSION, XR_FB_color_space_SPEC_VERSION,
                                   XR_KHR_composition_layer_color_scale_bias_SPEC_VERSION,
-                                  XR_EXT_palm_pose_SPEC_VERSION, XR_EXT_debug_utils_SPEC_VERSION};
+                                  XR_EXT_debug_utils_SPEC_VERSION};
 #define NEXTS (sizeof exts / sizeof *exts)
 
 static XrResult XRAPI_CALL xrEnumerateApiLayerProperties_(uint32_t cap, uint32_t *n, XrApiLayerProperties *p) { (void)cap; (void)p; *n = 0; return XR_SUCCESS; }
