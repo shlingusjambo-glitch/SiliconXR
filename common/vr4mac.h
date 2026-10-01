@@ -7,9 +7,11 @@
 #define VR4_PORT_TCP 9945      // Mac app listens here
 #define VR4_PORT_DISCOVERY 9944 // Mac broadcasts "VR4MAC 9945" here once a second
 
-enum { VR4_HELLO = 1, VR4_CONFIG = 2, VR4_TRACKING = 3, VR4_VIDEO = 4, VR4_HAPTICS = 5, VR4_AUDIO = 6, VR4_REQUEST_IDR = 7 };
+enum { VR4_HELLO = 1, VR4_CONFIG = 2, VR4_TRACKING = 3, VR4_VIDEO = 4, VR4_HAPTICS = 5, VR4_AUDIO = 6, VR4_REQUEST_IDR = 7, VR4_MIC = 8 };
 // VR4_AUDIO S->C (only if HELLO had "audio": true): u64 time_ns (Mac clock, informational) + interleaved PCM s16le,
 // 48000 Hz, 2 channels, 480 frames (10 ms, 1920 bytes) per packet.
+// VR4_MIC C->S (only after CONFIG "mic": true; HELLO "mic": true = RECORD_AUDIO granted): u64 time_ns (Quest clock)
+// + mono PCM s16le, 48000 Hz, 480 samples (10 ms, 960 bytes) per packet.
 enum { VR4_BTN_A = 1, VR4_BTN_B = 2, VR4_BTN_X = 4, VR4_BTN_Y = 8, VR4_BTN_MENU = 16, VR4_BTN_STICK_CLICK = 32,
        VR4_BTN_TRIGGER_TOUCH = 64, VR4_BTN_THUMB_TOUCH = 128, VR4_BTN_STICK_TOUCH = 256 };
 enum { VR4_HAND_ACTIVE = 1, VR4_HAND_POSE_VALID = 2 };
