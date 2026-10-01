@@ -5,6 +5,7 @@
 // manifest and its oculus_touch default bindings.
 #define GL_SILENCE_DEPRECATION
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #include <OpenGL/gl3.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -473,6 +474,17 @@ static bool PollNextEvent(struct VREvent_t *e, uint32_t size) { (void)e; (void)s
 static bool ShouldApplicationPause(void) { return false; }
 static bool IsInputAvailable(void) { return !(shm && shm->input_blocked); }
 
+/// MacVR shows this as the game's name (the window title, e.g. "Minecraft* 1.20.1"). AppKit is only touched on the
+/// main thread, which is the render thread under GLFW's -XstartOnFirstThread.
+static void publish_app_name(void) {
+    if (!shm) return;
+    NSString *title = nil;
+    if ([NSThread isMainThread])
+        for (NSWindow *w in NSApp.windows) if (w.isVisible && w.title.length) { title = w.title; break; }
+    const char *name = title ? title.UTF8String : getprogname() && strcmp(getprogname(), "java") ? getprogname() : "Minecraft";
+    if (strncmp(shm->app_name, name, sizeof shm->app_name - 1)) snprintf(shm->app_name, sizeof shm->app_name, "%s", name);
+}
+
 // ---------------------------------------------------------------- IVRCompositor
 static VR4Pose renderHead;             // head pose handed out by the last WaitGetPoses
 static uint64_t renderTime, nextVsync;
@@ -486,6 +498,8 @@ static EVRCompositorError WaitGetPoses(TrackedDevicePose_t *render, uint32_t nr,
     nextVsync = (nextVsync && t - nextVsync < period ? nextVsync : t) + period;
     read_tracking();
     renderHead = track.head; renderTime = track.time_ns;
+    static uint64_t nameAt;
+    if (t > nameAt) { @autoreleasepool { publish_app_name(); } nameAt = t + 2000000000ull; }   // titles change (world names)
     TrackedDevicePose_t p[3] = {device_pose(0), device_pose(1), device_pose(2)};
     fill_velocities(p, 3);
     for (uint32_t i = 0; render && i < nr; i++) render[i] = i < 3 ? p[i] : (TrackedDevicePose_t){0};
@@ -687,7 +701,7 @@ EXPORT intptr_t VR_InitInternal2(EVRInitError *err, EVRApplicationType type, con
         return 0;
     }
     build_tables();
-    snprintf(shm->app_name, sizeof shm->app_name, "%s", getprogname() && strcmp(getprogname(), "java") ? getprogname() : "Minecraft");
+    @autoreleasepool { publish_app_name(); }
     logmsg("init ok, app type %d, eye %ux%u @ %.0f Hz", type, shm->eye_w, shm->eye_h, fps());
     if (err) *err = EVRInitError_VRInitError_None;
     return ++initToken;

@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 mkdir -p build
 ARCH="-arch arm64 -arch x86_64 -mmacosx-version-min=11.0"
 clang $ARCH -O2 -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -fobjc-arc -fvisibility=hidden -dynamiclib \
-    -install_name @rpath/libopenvr_api.dylib -o build/libopenvr_api.dylib vr4mac_openvr.m -framework Foundation -framework OpenGL
+    -install_name @rpath/libopenvr_api.dylib -o build/libopenvr_api.dylib vr4mac_openvr.m -framework Foundation -framework AppKit -framework OpenGL
 clang $ARCH -O2 -Wall -Wno-unused-parameter -fvisibility=hidden -dynamiclib \
     -install_name @rpath/liblwjgl_openvr.dylib -o build/liblwjgl_openvr.dylib lwjgl_openvr.c
 clang $ARCH -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -fno-objc-arc -fvisibility=hidden -dynamiclib -Iinclude \
