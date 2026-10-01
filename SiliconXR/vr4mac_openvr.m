@@ -68,9 +68,24 @@ static HmdMatrix34_t inv34(HmdMatrix34_t a) {
     return r;
 }
 
+typedef struct { float x, y, z, w; } Quat;
+static inline Quat q_mul(Quat a, Quat b) {
+    return (Quat){a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                  a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                  a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                  a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+static inline Quat q_conj(Quat a) { return (Quat){-a.x, -a.y, -a.z, a.w}; }
+static inline Quat device_quat(int i) {
+    VR4Pose p = i == 0 ? track.head : track.hand[i - 1].grip;
+    float w = p.qw;
+    if (p.qx == 0 && p.qy == 0 && p.qz == 0 && w == 0) w = 1.0f;
+    return (Quat){p.qx, p.qy, p.qz, w};
+}
+
 // ---------------------------------------------------------------- devices: 0 = HMD, 1 = left hand, 2 = right hand
 static int hand_valid(int h) { return (track.hand[h].flags & VR4_HAND_POSE_VALID) != 0; }
-static TrackedDevicePose_t prevPose[3]; static uint64_t prevPoseT;
+static TrackedDevicePose_t prevPose[3]; static Quat prevQuat[3]; static uint64_t prevPoseT;
 static TrackedDevicePose_t device_pose(int i) {
     TrackedDevicePose_t p = {0};
     if (i < 0 || i > 2) return p;
@@ -81,18 +96,59 @@ static TrackedDevicePose_t device_pose(int i) {
     return p;
 }
 static void fill_velocities(TrackedDevicePose_t *p, int n) {   // finite difference against the previous sample
-    double dt = prevPoseT && track.time_ns > prevPoseT ? (track.time_ns - prevPoseT) / 1e9 : 0;
+    double dt = prevPoseT && track.time_ns > prevPoseT ? (double)(track.time_ns - prevPoseT) * 1e-9 : 0;
     for (int i = 0; i < n && i < 3; i++) {
-        if (dt > 0 && dt < 0.2)
-            for (int k = 0; k < 3; k++) p[i].vVelocity.v[k] = (float)((p[i].mDeviceToAbsoluteTracking.m[k][3] - prevPose[i].mDeviceToAbsoluteTracking.m[k][3]) / dt);
-        else p[i].vVelocity = prevPose[i].vVelocity;
+        Quat curQ = device_quat(i);
+        if (dt >= 0.002 && dt <= 0.2) {
+            float vx = (p[i].mDeviceToAbsoluteTracking.m[0][3] - prevPose[i].mDeviceToAbsoluteTracking.m[0][3]) / (float)dt;
+            float vy = (p[i].mDeviceToAbsoluteTracking.m[1][3] - prevPose[i].mDeviceToAbsoluteTracking.m[1][3]) / (float)dt;
+            float vz = (p[i].mDeviceToAbsoluteTracking.m[2][3] - prevPose[i].mDeviceToAbsoluteTracking.m[2][3]) / (float)dt;
+            float vMag = sqrtf(vx * vx + vy * vy + vz * vz);
+            if (vMag > 40.0f) { float s = 40.0f / vMag; vx *= s; vy *= s; vz *= s; }
+            if (prevPose[i].vVelocity.v[0] != 0 || prevPose[i].vVelocity.v[1] != 0 || prevPose[i].vVelocity.v[2] != 0) {
+                p[i].vVelocity.v[0] = 0.75f * vx + 0.25f * prevPose[i].vVelocity.v[0];
+                p[i].vVelocity.v[1] = 0.75f * vy + 0.25f * prevPose[i].vVelocity.v[1];
+                p[i].vVelocity.v[2] = 0.75f * vz + 0.25f * prevPose[i].vVelocity.v[2];
+            } else {
+                p[i].vVelocity.v[0] = vx; p[i].vVelocity.v[1] = vy; p[i].vVelocity.v[2] = vz;
+            }
+
+            Quat qrel = q_mul(curQ, q_conj(prevQuat[i]));
+            if (qrel.w < 0.0f) qrel = (Quat){-qrel.x, -qrel.y, -qrel.z, -qrel.w};
+            if (qrel.w > 1.0f) qrel.w = 1.0f;
+            float angle = 2.0f * acosf(qrel.w);
+            float sinHalf = sqrtf(fmaxf(0.0f, 1.0f - qrel.w * qrel.w));
+            float wx = 0, wy = 0, wz = 0;
+            if (sinHalf > 1e-4f && angle > 1e-4f) {
+                float factor = (angle / (float)dt) / sinHalf;
+                wx = qrel.x * factor; wy = qrel.y * factor; wz = qrel.z * factor;
+            }
+            float wMag = sqrtf(wx * wx + wy * wy + wz * wz);
+            if (wMag > 100.0f) { float s = 100.0f / wMag; wx *= s; wy *= s; wz *= s; }
+            if (prevPose[i].vAngularVelocity.v[0] != 0 || prevPose[i].vAngularVelocity.v[1] != 0 || prevPose[i].vAngularVelocity.v[2] != 0) {
+                p[i].vAngularVelocity.v[0] = 0.75f * wx + 0.25f * prevPose[i].vAngularVelocity.v[0];
+                p[i].vAngularVelocity.v[1] = 0.75f * wy + 0.25f * prevPose[i].vAngularVelocity.v[1];
+                p[i].vAngularVelocity.v[2] = 0.75f * wz + 0.25f * prevPose[i].vAngularVelocity.v[2];
+            } else {
+                p[i].vAngularVelocity.v[0] = wx; p[i].vAngularVelocity.v[1] = wy; p[i].vAngularVelocity.v[2] = wz;
+            }
+        } else {
+            p[i].vVelocity = prevPose[i].vVelocity;
+            p[i].vAngularVelocity = prevPose[i].vAngularVelocity;
+        }
     }
-    if (track.time_ns != prevPoseT) { for (int i = 0; i < n && i < 3; i++) prevPose[i] = p[i]; prevPoseT = track.time_ns; }
+    if (track.time_ns != prevPoseT) {
+        for (int i = 0; i < n && i < 3; i++) {
+            prevPose[i] = p[i];
+            prevQuat[i] = device_quat(i);
+        }
+        prevPoseT = track.time_ns;
+    }
 }
 
 // ---------------------------------------------------------------- input: manifest + oculus_touch bindings
 enum { MODE_BUTTON, MODE_TRIGGER, MODE_JOYSTICK, MODE_TOGGLE, MODE_SCROLL };
-typedef struct { char name[128]; char type[16]; int hand; float x, y, px, py; int state, prevState, origin; } Action;   // hand: pose/haptic actions
+typedef struct { char name[128]; char type[16]; int hand, isAim; float x, y, px, py; int state, prevState, origin; } Action;   // hand: pose/haptic actions
 typedef struct { int set, action, hand, mode; char comp[24], input[16]; } Binding;
 typedef struct { int set, action, hand[2]; char comp[2][24]; } Chord;
 static Action actions[512]; static int nactions;
@@ -137,7 +193,11 @@ static void load_bindings(NSString *file) {
         NSDictionary *s = bindings[setName];
         for (NSDictionary *p in s[@"poses"]) {
             int a = add_action([p[@"output"] UTF8String], "pose");
-            if (a >= 0) actions[a].hand = hand_of(p[@"path"]);
+            if (a >= 0) {
+                actions[a].hand = hand_of(p[@"path"]);
+                NSString *path = p[@"path"];
+                actions[a].isAim = path && [path rangeOfString:@"/aim/" options:NSCaseInsensitiveSearch].location != NSNotFound;
+            }
         }
         for (NSDictionary *p in s[@"haptics"]) {
             int a = add_action([p[@"output"] UTF8String], "vibration");
@@ -334,6 +394,9 @@ static EVRInputError GetPoseActionDataForNextFrame(VRActionHandle_t h, ETracking
     TrackedDevicePose_t p[3] = {device_pose(0), device_pose(1), device_pose(2)};
     fill_velocities(p, 3);
     d->pose = p[a->hand + 1];
+    if (a->isAim && hand_valid(a->hand)) {
+        d->pose.mDeviceToAbsoluteTracking = mat(track.hand[a->hand].aim);
+    }
     return EVRInputError_VRInputError_None;
 }
 static EVRInputError GetOriginTrackedDeviceInfo(VRInputValueHandle_t origin, InputOriginInfo_t *info, uint32_t size) {
@@ -474,6 +537,63 @@ static bool PollNextEvent(struct VREvent_t *e, uint32_t size) { (void)e; (void)s
 static bool ShouldApplicationPause(void) { return false; }
 static bool IsInputAvailable(void) { return !(shm && shm->input_blocked); }
 
+static bool GetControllerState(TrackedDeviceIndex_t i, VRControllerState_t *cs, uint32_t size) {
+    if (i != 1 && i != 2) return false;
+    if (!cs || size < sizeof(VRControllerState_t)) return false;
+    read_tracking();
+    if (shm && shm->input_blocked) {
+        memset(cs, 0, sizeof(*cs));
+        return true;
+    }
+    const VR4Hand *h = &track.hand[i - 1];
+    memset(cs, 0, sizeof(*cs));
+    cs->unPacketNum = (uint32_t)(track.time_ns / 1000000);
+    uint64_t pressed = 0, touched = 0;
+    if (h->flags & VR4_HAND_ACTIVE) {
+        if (h->trigger > 0.5f) pressed |= (1ULL << EVRButtonId_k_EButton_SteamVR_Trigger) | (1ULL << EVRButtonId_k_EButton_Axis1);
+        if (h->trigger > 0.05f || (h->buttons & VR4_BTN_TRIGGER_TOUCH)) touched |= (1ULL << EVRButtonId_k_EButton_SteamVR_Trigger) | (1ULL << EVRButtonId_k_EButton_Axis1);
+        if (h->squeeze > 0.5f) pressed |= (1ULL << EVRButtonId_k_EButton_Grip) | (1ULL << EVRButtonId_k_EButton_Axis2);
+        if (h->squeeze > 0.05f) touched |= (1ULL << EVRButtonId_k_EButton_Grip) | (1ULL << EVRButtonId_k_EButton_Axis2);
+        if (h->buttons & VR4_BTN_STICK_CLICK) pressed |= (1ULL << EVRButtonId_k_EButton_SteamVR_Touchpad) | (1ULL << EVRButtonId_k_EButton_Axis0);
+        if ((h->buttons & VR4_BTN_STICK_TOUCH) || fabsf(h->stick_x) > 0.1f || fabsf(h->stick_y) > 0.1f) touched |= (1ULL << EVRButtonId_k_EButton_SteamVR_Touchpad) | (1ULL << EVRButtonId_k_EButton_Axis0);
+        if (i == 1) {
+            if (h->buttons & VR4_BTN_X) pressed |= (1ULL << EVRButtonId_k_EButton_A);
+            if (h->buttons & VR4_BTN_Y) pressed |= (1ULL << EVRButtonId_k_EButton_ApplicationMenu);
+        } else {
+            if (h->buttons & VR4_BTN_A) pressed |= (1ULL << EVRButtonId_k_EButton_A);
+            if (h->buttons & VR4_BTN_B) pressed |= (1ULL << EVRButtonId_k_EButton_ApplicationMenu);
+        }
+        if (h->buttons & VR4_BTN_THUMB_TOUCH) touched |= (1ULL << EVRButtonId_k_EButton_A) | (1ULL << EVRButtonId_k_EButton_ApplicationMenu);
+        if (h->buttons & VR4_BTN_MENU) pressed |= (1ULL << EVRButtonId_k_EButton_ApplicationMenu);
+        cs->rAxis[0].x = h->stick_x;
+        cs->rAxis[0].y = h->stick_y;
+        cs->rAxis[1].x = h->trigger;
+        cs->rAxis[2].x = h->squeeze;
+    }
+    cs->ulButtonPressed = pressed;
+    cs->ulButtonTouched = touched;
+    return true;
+}
+
+static bool GetControllerStateWithPose(ETrackingUniverseOrigin o, TrackedDeviceIndex_t i, VRControllerState_t *cs, uint32_t size, TrackedDevicePose_t *pose) {
+    (void)o;
+    if (!GetControllerState(i, cs, size)) return false;
+    if (pose) {
+        *pose = device_pose((int)i);
+        fill_velocities(pose, 1);
+    }
+    return true;
+}
+
+static void TriggerHapticPulse(TrackedDeviceIndex_t i, uint32_t axis, unsigned short durUs) {
+    (void)axis;
+    if ((i != 1 && i != 2) || !shm) return;
+    float dur = durUs > 0 ? (float)durUs / 1000000.0f : 0.02f;
+    shm->haptic = (VR4Haptics){(uint8_t)(i - 1), 1.0f, dur, 160.0f};
+    vr4_fence();
+    shm->haptic_seq++;
+}
+
 /// MacVR shows this as the game's name (the window title, e.g. "Minecraft* 1.20.1"). AppKit is only touched on the
 /// main thread, which is the render thread under GLFW's -XstartOnFirstThread.
 static void publish_app_name(void) {
@@ -585,6 +705,20 @@ static void SuspendRendering(bool b) { (void)b; }
 static uint32_t GetVulkanExtensionsRequired(char *v, uint32_t n) { if (v && n) *v = 0; return 1; }   // both Vulkan variants (2 args)
 static uint32_t GetVulkanDeviceExtensionsRequired(void *pd, char *v, uint32_t n) { (void)pd; return GetVulkanExtensionsRequired(v, n); }
 static bool IsMotionSmoothingEnabled(void) { return false; }
+static EVRCompositorError GetLastPoseForTrackedDeviceIndex(TrackedDeviceIndex_t i, TrackedDevicePose_t *render, TrackedDevicePose_t *game) {
+    TrackedDevicePose_t p = device_pose((int)i);
+    fill_velocities(&p, 1);
+    if (render) *render = p;
+    if (game) *game = p;
+    return EVRCompositorError_VRCompositorError_None;
+}
+static void FadeToColor(float fSeconds, float fRed, float fGreen, float fBlue, float fAlpha, bool bBackground) {
+    (void)fSeconds; (void)fRed; (void)fGreen; (void)fBlue; (void)fAlpha; (void)bBackground;
+}
+static struct HmdColor_t GetCurrentFadeColor(bool bBackground) {
+    (void)bBackground;
+    return (struct HmdColor_t){0, 0, 0, 0};
+}
 
 // ---------------------------------------------------------------- IVRChaperone / IVRRenderModels / IVRSettings / IVRApplications
 static ChaperoneCalibrationState GetCalibrationState(void) { return ChaperoneCalibrationState_OK; }
@@ -633,13 +767,14 @@ static struct VR_IVRSystem_FnTable sys;
 static struct VR_IVRCompositor_FnTable comp;
 static struct VR_IVRInput_FnTable input;
 static struct VR_IVRChaperone_FnTable chap;
+static struct VR_IVRChaperoneSetup_FnTable chapSetup;
 static struct VR_IVRRenderModels_FnTable models;
 static struct VR_IVRSettings_FnTable settings;
 static struct VR_IVRApplications_FnTable apps;
 static void *comp028[sizeof comp / sizeof(void *) + 1];   // IVRCompositor_028 (OpenVR 2.x) = 027 + SubmitWithArrayIndex after Submit
 
 static void build_tables(void) {
-    FILL(sys); FILL(comp); FILL(input); FILL(chap); FILL(models); FILL(settings); FILL(apps);
+    FILL(sys); FILL(comp); FILL(input); FILL(chap); FILL(chapSetup); FILL(models); FILL(settings); FILL(apps);
     sys.GetRecommendedRenderTargetSize = GetRecommendedRenderTargetSize; sys.GetProjectionMatrix = GetProjectionMatrix;
     sys.GetProjectionRaw = GetProjectionRaw; sys.ComputeDistortion = ComputeDistortion; sys.GetEyeToHeadTransform = GetEyeToHeadTransform;
     sys.GetDeviceToAbsoluteTrackingPose = GetDeviceToAbsoluteTrackingPose;
@@ -653,11 +788,15 @@ static void build_tables(void) {
     sys.GetInt32TrackedDeviceProperty = GetInt32TrackedDeviceProperty; sys.GetUint64TrackedDeviceProperty = GetUint64TrackedDeviceProperty;
     sys.GetStringTrackedDeviceProperty = GetStringTrackedDeviceProperty;
     sys.PollNextEvent = PollNextEvent; sys.GetHiddenAreaMesh = GetHiddenAreaMesh;
+    sys.GetControllerState = GetControllerState; sys.GetControllerStateWithPose = GetControllerStateWithPose;
+    sys.TriggerHapticPulse = TriggerHapticPulse;
     sys.ShouldApplicationPause = ShouldApplicationPause; sys.IsInputAvailable = IsInputAvailable;
 
     comp.SetTrackingSpace = SetTrackingSpace; comp.GetTrackingSpace = GetTrackingSpace; comp.WaitGetPoses = WaitGetPoses;
-    comp.GetLastPoses = GetLastPoses; comp.Submit = Submit; comp.PostPresentHandoff = PostPresentHandoff;
+    comp.GetLastPoses = GetLastPoses; comp.GetLastPoseForTrackedDeviceIndex = GetLastPoseForTrackedDeviceIndex;
+    comp.Submit = Submit; comp.PostPresentHandoff = PostPresentHandoff;
     comp.ClearLastSubmittedFrame = ClearLastSubmittedFrame; comp.GetFrameTimeRemaining = GetFrameTimeRemaining;
+    comp.FadeToColor = FadeToColor; comp.GetCurrentFadeColor = GetCurrentFadeColor;
     comp.CanRenderScene = CanRenderScene; comp.IsFullscreen = IsFullscreen; comp.SuspendRendering = SuspendRendering;
     comp.GetVulkanInstanceExtensionsRequired = GetVulkanExtensionsRequired;
     comp.GetVulkanDeviceExtensionsRequired = (void *)GetVulkanDeviceExtensionsRequired;
@@ -672,6 +811,7 @@ static void build_tables(void) {
 
     chap.GetCalibrationState = GetCalibrationState; chap.GetPlayAreaSize = GetPlayAreaSize;
     chap.GetPlayAreaRect = GetPlayAreaRect; chap.AreBoundsVisible = AreBoundsVisible;
+    chapSetup.GetWorkingPlayAreaSize = GetPlayAreaSize; chapSetup.GetWorkingPlayAreaRect = GetPlayAreaRect;
     models.GetRenderModelCount = GetRenderModelCount; models.GetComponentButtonMask = GetComponentButtonMask;
     models.GetComponentStateForDevicePath = GetComponentStateForDevicePath;
     settings.GetFloat = GetFloat; settings.GetBool = GetBool; settings.GetInt32 = GetInt32; settings.GetString = GetString;
@@ -723,8 +863,16 @@ EXPORT const char *VR_GetVRInitErrorAsEnglishDescription(EVRInitError e) {
     return e == 0 ? "No error" : e == 108 ? "MacVR is not running. Open MacVR and connect your headset, then enable VR again." : "MacVR OpenVR error";
 }
 static const struct { const char *name; void *table; } interfaces[] = {
-    {"IVRSystem_022", &sys}, {"IVRCompositor_028", comp028}, {"IVRCompositor_027", &comp}, {"IVRCompositor_026", &comp}, {"IVRInput_010", &input},
-    {"IVRChaperone_004", &chap}, {"IVRRenderModels_006", &models}, {"IVRSettings_003", &settings}, {"IVRApplications_007", &apps},
+    {"IVRSystem_022", &sys}, {"IVRSystem_021", &sys}, {"IVRSystem_020", &sys}, {"IVRSystem_019", &sys},
+    {"IVRCompositor_028", comp028}, {"IVRCompositor_027", &comp}, {"IVRCompositor_026", &comp},
+    {"IVRCompositor_022", &comp}, {"IVRCompositor_021", &comp}, {"IVRCompositor_020", &comp},
+    {"IVRCompositor_019", &comp}, {"IVRCompositor_018", &comp}, {"IVRCompositor_017", &comp},
+    {"IVRInput_010", &input}, {"IVRInput_007", &input}, {"IVRInput_006", &input}, {"IVRInput_005", &input}, {"IVRInput_004", &input},
+    {"IVRChaperone_004", &chap}, {"IVRChaperone_003", &chap},
+    {"IVRChaperoneSetup_006", &chapSetup}, {"IVRChaperoneSetup_005", &chapSetup},
+    {"IVRRenderModels_006", &models}, {"IVRRenderModels_005", &models},
+    {"IVRSettings_003", &settings}, {"IVRSettings_002", &settings}, {"IVRSettings_001", &settings},
+    {"IVRApplications_007", &apps}, {"IVRApplications_006", &apps}, {"IVRApplications_005", &apps},
 };
 EXPORT bool VR_IsInterfaceVersionValid(const char *v) {
     for (size_t i = 0; i < sizeof interfaces / sizeof *interfaces; i++) if (!strcmp(v, interfaces[i].name)) return true;

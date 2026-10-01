@@ -140,18 +140,18 @@ static float comp_value(const VR4Hand *h, const char *c) {
     #define IS(p) (!strncmp(c, p, strlen(p)))
     if (IS("trigger/touch")) return btn(h, VR4_BTN_TRIGGER_TOUCH);
     if (IS("trigger") || IS("select")) return h->trigger;
-    if (IS("squeeze") || IS("grip/value") || IS("grip/click")) return h->squeeze;
-    if (IS("thumbstick/x") || IS("trackpad/x")) return h->stick_x;
-    if (IS("thumbstick/y") || IS("trackpad/y")) return h->stick_y;
-    if (IS("thumbstick/click") || IS("trackpad/click")) return btn(h, VR4_BTN_STICK_CLICK);
-    if (IS("thumbstick/touch") || IS("trackpad/touch")) return btn(h, VR4_BTN_STICK_TOUCH);
+    if (IS("squeeze") || IS("grip/value") || IS("grip/click") || IS("grip/force") || IS("squeeze/force")) return h->squeeze;
+    if (IS("thumbstick/x") || IS("trackpad/x") || IS("joystick/x")) return h->stick_x;
+    if (IS("thumbstick/y") || IS("trackpad/y") || IS("joystick/y")) return h->stick_y;
+    if (IS("thumbstick/click") || IS("trackpad/click") || IS("joystick/click")) return btn(h, VR4_BTN_STICK_CLICK);
+    if (IS("thumbstick/touch") || IS("trackpad/touch") || IS("joystick/touch")) return btn(h, VR4_BTN_STICK_TOUCH);
     if (IS("thumbrest/touch")) return btn(h, VR4_BTN_THUMB_TOUCH);
     if (IS("a/click")) return btn(h, VR4_BTN_A);
     if (IS("b/click")) return btn(h, VR4_BTN_B);
     if (IS("x/click")) return btn(h, VR4_BTN_X);
     if (IS("y/click")) return btn(h, VR4_BTN_Y);
     if (IS("a/touch") || IS("b/touch") || IS("x/touch") || IS("y/touch")) return btn(h, VR4_BTN_THUMB_TOUCH);
-    if (IS("menu/click")) return btn(h, VR4_BTN_MENU);
+    if (IS("menu/click") || IS("system/click") || IS("menu") || IS("system")) return btn(h, VR4_BTN_MENU);
     return 0;
     #undef IS
 }
@@ -373,12 +373,14 @@ static const char *exts[] = {XR_KHR_METAL_ENABLE_EXTENSION_NAME, XR_KHR_CONVERT_
                              XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
                              XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME,
                              XR_EXT_LOCAL_FLOOR_EXTENSION_NAME, XR_FB_COLOR_SPACE_EXTENSION_NAME,
-                             XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME};
+                             XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME,
+                             XR_EXT_PALM_POSE_EXTENSION_NAME, XR_EXT_DEBUG_UTILS_EXTENSION_NAME};
 static const uint32_t extVer[] = {XR_KHR_metal_enable_SPEC_VERSION, XR_KHR_convert_timespec_time_SPEC_VERSION,
                                   XR_FB_display_refresh_rate_SPEC_VERSION, XR_KHR_composition_layer_depth_SPEC_VERSION,
                                   XR_KHR_composition_layer_cylinder_SPEC_VERSION, XR_KHR_visibility_mask_SPEC_VERSION,
                                   XR_EXT_local_floor_SPEC_VERSION, XR_FB_color_space_SPEC_VERSION,
-                                  XR_KHR_composition_layer_color_scale_bias_SPEC_VERSION};
+                                  XR_KHR_composition_layer_color_scale_bias_SPEC_VERSION,
+                                  XR_EXT_palm_pose_SPEC_VERSION, XR_EXT_debug_utils_SPEC_VERSION};
 #define NEXTS (sizeof exts / sizeof *exts)
 
 static XrResult XRAPI_CALL xrEnumerateApiLayerProperties_(uint32_t cap, uint32_t *n, XrApiLayerProperties *p) { (void)cap; (void)p; *n = 0; return XR_SUCCESS; }
@@ -956,8 +958,20 @@ static XrResult XRAPI_CALL xrSuggestInteractionProfileBindings_(XrInstance i, co
 static XrResult XRAPI_CALL xrAttachSessionActionSets_(XrSession h, const XrSessionActionSetsAttachInfo *ai) {
     Session *s = (Session *)h; (void)ai;
     XrPath touch = intern("/interaction_profiles/oculus/touch_controller");
-    s->profile = nsugg ? sugg[0].profile : touch;
-    for (int k = 0; k < nsugg; k++) if (sugg[k].profile == touch) s->profile = touch;
+    XrPath touchPlus = intern("/interaction_profiles/meta/touch_controller_plus");
+    XrPath touchPro = intern("/interaction_profiles/meta/touch_pro_controller");
+    XrPath index = intern("/interaction_profiles/valve/index_controller");
+    XrPath simple = intern("/interaction_profiles/khr/simple_controller");
+
+    XrPath best = XR_NULL_PATH;
+    for (int k = 0; k < nsugg; k++) {
+        if (sugg[k].profile == touch) { best = touch; break; }
+        if (sugg[k].profile == touchPlus && (!best || best == simple)) best = touchPlus;
+        if (sugg[k].profile == touchPro && (!best || best == simple)) best = touchPro;
+        if (sugg[k].profile == index && (!best || best == simple)) best = index;
+        if (!best && sugg[k].profile != simple) best = sugg[k].profile;
+    }
+    s->profile = best ? best : (nsugg ? sugg[0].profile : touch);
     for (int k = 0; k < nsugg; k++) {
         Action *a = sugg[k].action;
         if (sugg[k].profile != s->profile || a->nb >= 16) continue;
@@ -992,7 +1006,8 @@ static float action_value(Session *s, Action *a, XrPath sub, XrVector2f *v2, int
         *bound = 1;
         if (!active(s)) continue;
         const VR4Hand *hh = &track.hand[b->hand];
-        if (v2 && (!strcmp(b->comp, "thumbstick") || !strcmp(b->comp, "trackpad"))) {
+        if (v2 && (!strcmp(b->comp, "thumbstick") || !strcmp(b->comp, "trackpad") || !strcmp(b->comp, "joystick") ||
+                   !strcmp(b->comp, "thumbstick/2d") || !strcmp(b->comp, "trackpad/2d") || !strcmp(b->comp, "joystick/2d"))) {
             if (fabsf(hh->stick_x) + fabsf(hh->stick_y) > fabsf(v2->x) + fabsf(v2->y)) *v2 = (XrVector2f){hh->stick_x, hh->stick_y};
             continue;
         }
@@ -1030,8 +1045,9 @@ static XrResult XRAPI_CALL xrGetActionStatePose_(XrSession h, const XrActionStat
     (void)h; Action *a = (Action *)gi->action;
     st->isActive = XR_FALSE;
     for (int i = 0; i < a->nb; i++)
-        if (is_pose_comp(a->b[i].comp) && sub_matches(gi->subactionPath, a->b[i].hand))
-            st->isActive = (track.hand[a->b[i].hand].flags & VR4_HAND_ACTIVE) != 0;
+        if (is_pose_comp(a->b[i].comp) && sub_matches(gi->subactionPath, a->b[i].hand)) {
+            if (track.hand[a->b[i].hand].flags & VR4_HAND_ACTIVE) st->isActive = XR_TRUE;
+        }
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrEnumerateBoundSourcesForAction_(XrSession h, const XrBoundSourcesForActionEnumerateInfo *ei, uint32_t cap, uint32_t *n, XrPath *out) {
@@ -1097,6 +1113,15 @@ static XrResult XRAPI_CALL xrSetColorSpaceFB_(XrSession h, const XrColorSpaceFB 
     return XR_SUCCESS;
 }
 
+static XrResult XRAPI_CALL xrSetDebugUtilsObjectNameEXT_(XrInstance i, const XrDebugUtilsObjectNameInfoEXT *n) { (void)i; (void)n; return XR_SUCCESS; }
+static XrResult XRAPI_CALL xrCreateDebugUtilsMessengerEXT_(XrInstance i, const XrDebugUtilsMessengerCreateInfoEXT *ci, XrDebugUtilsMessengerEXT *out) {
+    (void)i; (void)ci; *out = (XrDebugUtilsMessengerEXT)(uintptr_t)1; return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrDestroyDebugUtilsMessengerEXT_(XrDebugUtilsMessengerEXT m) { (void)m; return XR_SUCCESS; }
+static XrResult XRAPI_CALL xrSessionBeginDebugUtilsLabelRegionEXT_(XrSession s, const XrDebugUtilsLabelEXT *l) { (void)s; (void)l; return XR_SUCCESS; }
+static XrResult XRAPI_CALL xrSessionEndDebugUtilsLabelRegionEXT_(XrSession s) { (void)s; return XR_SUCCESS; }
+static XrResult XRAPI_CALL xrSessionInsertDebugUtilsLabelEXT_(XrSession s, const XrDebugUtilsLabelEXT *l) { (void)s; (void)l; return XR_SUCCESS; }
+
 // ---------------------------------------------------------------- dispatch
 static XrResult XRAPI_CALL xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xrVoidFunction *fn);
 static const struct { const char *name; PFN_xrVoidFunction fn; } table[] = {
@@ -1117,6 +1142,8 @@ static const struct { const char *name; PFN_xrVoidFunction fn; } table[] = {
     F(xrGetInputSourceLocalizedName) F(xrApplyHapticFeedback) F(xrStopHapticFeedback)
     F(xrEnumerateDisplayRefreshRatesFB) F(xrGetDisplayRefreshRateFB) F(xrRequestDisplayRefreshRateFB) F(xrGetVisibilityMaskKHR)
     F(xrEnumerateColorSpacesFB) F(xrSetColorSpaceFB)
+    F(xrSetDebugUtilsObjectNameEXT) F(xrCreateDebugUtilsMessengerEXT) F(xrDestroyDebugUtilsMessengerEXT)
+    F(xrSessionBeginDebugUtilsLabelRegionEXT) F(xrSessionEndDebugUtilsLabelRegionEXT) F(xrSessionInsertDebugUtilsLabelEXT)
 #undef F
 };
 static XrResult XRAPI_CALL xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xrVoidFunction *fn) {
