@@ -2,6 +2,7 @@
 // WineXR (runtime/vr4mac_openxr.c), and the session, space, action and pacing logic is kept the same. Poses and input come from the MacVR app
 // through shared memory (common/vr4mac.h); Metal eye images are read back into the frames the Mac app streams.
 // Graphics: XR_KHR_metal_enable. Built without ARC (Metal objects live in C structs).
+// Quad, cylinder and equirect layers are composited on the GPU (composite()); hand tracking comes from the MacVR hands.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <fcntl.h>
@@ -19,7 +20,7 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/openxr_reflection.h>
-#include "../../common/vr4mac.h"
+#include "../siliconxr_shared.h"
 
 #define EXPORT __attribute__((visibility("default")))
 #define MAXN 256
@@ -76,9 +77,9 @@ static XrPath intern(const char *s) {
 static const char *pstr(XrPath p) { return p >= 1 && p <= (XrPath)npaths ? paths[p - 1] : ""; }
 
 // ---------------------------------------------------------------- objects
-typedef struct { int hand; char comp[64]; } Binding;
+typedef struct { int hand, hp; char comp[64]; } Binding;   // hp: from the hand-interaction profile (used while that hand is tracked)
 typedef struct { uint32_t gen; float cur[2], prev[2]; } ActionHistory;
-typedef struct Action { XrActionType type; char name[64]; XrPath sub[8]; int nsub; Binding b[16]; int nb; ActionHistory hist[3]; } Action;
+typedef struct Action { XrActionType type; char name[64]; XrPath sub[8]; int nsub; Binding b[32]; int nb; ActionHistory hist[3]; } Action;
 typedef struct { char name[64]; } ActionSet;
 typedef struct { XrPath profile; Action *action; XrPath binding; } Suggestion;
 typedef struct {
@@ -86,16 +87,21 @@ typedef struct {
 } Space;
 typedef struct {
     id<MTLTexture> img[3]; int count, acquired, released; MTLPixelFormat fmt; uint32_t w, h, array, mips;
+    XrSwapchainStateFoveationFlagsFB fovFlags; XrFoveationProfileFB fovProfile;   // XR_FB_foveation: a hint, kept for xrGetSwapchainStateFB
 } Swapchain;
 typedef struct {
     id<MTLCommandQueue> queue; int running, focused, exitRequested;
     id<MTLBuffer> ring[NRING]; volatile int busy[NRING]; size_t ringSize;   // readback buffers, busy while the GPU/copy owns them
     XrPosef localOrigin; V localOriginRaw; XrPath profile;
+    XrPath handProfile; int kind, handMode[2];   // hand-interaction profile (if suggested), controller kind, hand-tracked per hand
+    int present, perfMetrics;                    // XR_EXT_user_presence state (-1 = not reported yet); XR_META_performance_metrics on
+    id<MTLTexture> comp;                         // composition target for extra layers, both eyes side by side
     uint64_t lastPublished;   // displayTime of the last actually-published frame (duplicate-submit skip)
 } Session;
 
 static Suggestion sugg[1024]; static int nsugg;
 static VR4Tracking track;           // input snapshot (hands/buttons), refreshed by xrSyncActions
+static VR4HandJoints joints[2];     // hand-tracking joints of the same snapshot (joints[h].tracked = controller put down)
 static VR4Tracking frameTrack;      // head/eyes of the latest xrWaitFrame
 static VR4Tracking frameRing[4]; static int frameRingN;   // recent xrWaitFrame snapshots, for pipelined apps
 static uint32_t lastSeq;
@@ -108,13 +114,16 @@ static int64_t qpcOffsetNs;         // XrTime - CLOCK_MONOTONIC time
 static int64_t qpc_ns(void) { return (int64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC); }
 static dispatch_queue_t publish_queue(void);
 
-static void push_state(XrSessionState st) {
+static XrEventDataBuffer *push_event(XrStructureType type) {
     if (evTail - evHead >= 64) evHead = evTail - 63;
-    XrEventDataSessionStateChanged *e = (XrEventDataSessionStateChanged *)&events[evTail % 64];
-    memset(e, 0, sizeof(XrEventDataBuffer));
-    e->type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED; e->session = (XrSession)theSession; e->state = st;
-    e->time = qpc_ns() + qpcOffsetNs;
-    evTail++;
+    XrEventDataBuffer *e = &events[evTail++ % 64];
+    memset(e, 0, sizeof *e);
+    e->type = type;
+    return e;
+}
+static void push_state(XrSessionState st) {
+    XrEventDataSessionStateChanged *e = (XrEventDataSessionStateChanged *)push_event(XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED);
+    e->session = (XrSession)theSession; e->state = st; e->time = qpc_ns() + qpcOffsetNs;
 }
 
 /// Head/eye snapshot handed out by the xrWaitFrame that predicted `t` (falls back to the latest).
@@ -123,39 +132,82 @@ static const VR4Tracking *frame_for(XrTime t) {
     return &frameTrack;
 }
 static void update_velocities(const VR4Tracking *t);
+static VR4Eye frame_eye(const VR4Tracking *ft, int e);
 static int read_tracking(void) {   // seqlock read of the Mac app's latest tracking sample
-    for (int tries = 0; tries < 100; tries++) {
-        uint32_t s1 = shm->track_seq; vr4_fence();
-        if (s1 & 1) continue;
-        VR4Tracking t = shm->track; vr4_fence();
-        if (shm->track_seq == s1) { int fresh = s1 != lastSeq; track = t; lastSeq = s1; if (fresh) update_velocities(&track); return fresh; }
-    }
-    return 0;
+    int fresh = sxr_read(shm, &track, joints, &lastSeq);
+    if (fresh) update_velocities(&track);
+    return fresh;
 }
 
 // ---------------------------------------------------------------- input mapping
+// Controller profiles we serve from the Touch controllers, best first (an app's best suggested one is bound). Unknown
+// profiles rank just above simple_controller: their a/b/x/y/thumbstick/trigger/squeeze names still map.
+enum { K_TOUCH, K_INDEX, K_HP, K_WMR, K_VIVE, K_SIMPLE, K_OTHER };
+static const struct { const char *path; int kind; } profileTable[] = {
+    {"/interaction_profiles/oculus/touch_controller", K_TOUCH},
+    {"/interaction_profiles/meta/touch_controller_plus", K_TOUCH}, {"/interaction_profiles/meta/touch_plus_controller", K_TOUCH},
+    {"/interaction_profiles/facebook/touch_controller_pro", K_TOUCH}, {"/interaction_profiles/meta/touch_pro_controller", K_TOUCH},
+    {"/interaction_profiles/valve/index_controller", K_INDEX}, {"/interaction_profiles/hp/mixed_reality_controller", K_HP},
+    {"/interaction_profiles/microsoft/motion_controller", K_WMR}, {"/interaction_profiles/htc/vive_controller", K_VIVE},
+    {"/interaction_profiles/khr/simple_controller", K_SIMPLE},
+};
+#define NPROFILES (int)(sizeof profileTable / sizeof *profileTable)
+#define HAND_PROFILE "/interaction_profiles/ext/hand_interaction_ext"
+static int profile_index(XrPath p) {   // rank in profileTable; unknown controllers just above simple
+    for (int i = 0; i < NPROFILES; i++) if (!strcmp(pstr(p), profileTable[i].path)) return 2 * i;
+    return 2 * (NPROFILES - 1) - 1;
+}
+static int profile_kind(XrPath p) { int i = profile_index(p); return i & 1 ? K_OTHER : profileTable[i / 2].kind; }
+
 static int btn(const VR4Hand *h, uint32_t bit) { return (h->buttons & bit) != 0; }
-/// Scalar value of an input component path suffix like "trigger/value" or "a/click".
-static float comp_value(const VR4Hand *h, const char *c) {
+/// Scalar value of an input component path suffix like "trigger/value" or "a/click", remapped from Touch for every
+/// controller profile: Index/HP a,b on the left hand are X,Y; the Vive trackpad is the thumbstick; menu on the right
+/// hand of a Vive/WMR/simple controller is B (Touch has no right menu button). /click of an analog input is 0 or 1.
+static float comp_value(const VR4Hand *h, int hand, const char *c, int kind) {
     #define IS(p) (!strncmp(c, p, strlen(p)))
-    if (IS("trigger/touch")) return btn(h, VR4_BTN_TRIGGER_TOUCH);
-    if (IS("trigger") || IS("select")) return h->trigger;
-    if (IS("squeeze") || IS("grip/value") || IS("grip/click") || IS("grip/force") || IS("squeeze/force")) return h->squeeze;
-    if (IS("thumbstick/x") || IS("trackpad/x") || IS("joystick/x")) return h->stick_x;
-    if (IS("thumbstick/y") || IS("trackpad/y") || IS("joystick/y")) return h->stick_y;
-    if (IS("thumbstick/click") || IS("trackpad/click") || IS("joystick/click")) return btn(h, VR4_BTN_STICK_CLICK);
-    if (IS("thumbstick/touch") || IS("trackpad/touch") || IS("joystick/touch")) return btn(h, VR4_BTN_STICK_TOUCH);
-    if (IS("thumbrest/touch")) return btn(h, VR4_BTN_THUMB_TOUCH);
-    if (IS("a/click")) return btn(h, VR4_BTN_A);
-    if (IS("b/click")) return btn(h, VR4_BTN_B);
-    if (IS("x/click")) return btn(h, VR4_BTN_X);
-    if (IS("y/click")) return btn(h, VR4_BTN_Y);
-    if (IS("a/touch") || IS("b/touch") || IS("x/touch") || IS("y/touch")) return btn(h, VR4_BTN_THUMB_TOUCH);
-    if (IS("menu/click") || IS("system/click") || IS("menu") || IS("system")) return btn(h, VR4_BTN_MENU);
+    float v = 0;
+    uint32_t A = hand ? VR4_BTN_A : VR4_BTN_X, B = hand ? VR4_BTN_B : VR4_BTN_Y;
+    if (IS("trigger/touch") || IS("trigger/proximity")) return btn(h, VR4_BTN_TRIGGER_TOUCH);
+    if (IS("thumb_meta/proximity") || IS("thumb_fb/proximity")) return btn(h, VR4_BTN_THUMB_TOUCH) || btn(h, VR4_BTN_STICK_TOUCH);
+    if (IS("trigger/slide") || IS("thumbrest/force") || IS("stylus_fb/force")) return 0;   // no such sensors on Touch
+    if (IS("trigger/force")) return h->trigger > 0.9f ? (h->trigger - 0.9f) * 10 : 0;     // pressure past a full pull
+    if (IS("trigger") || IS("select")) v = h->trigger;                                     // value, click, curl
+    else if (IS("squeeze") || IS("grip/")) v = h->squeeze;                                 // value, click, force
+    else if (IS("trackpad") && kind != K_VIVE) return 0;                                  // Index/WMR pads: the stick is bound already
+    else if (IS("thumbstick/x") || IS("trackpad/x") || IS("joystick/x")) return h->stick_x;
+    else if (IS("thumbstick/y") || IS("trackpad/y") || IS("joystick/y")) return h->stick_y;
+    else if (IS("thumbstick/click") || IS("trackpad/click") || IS("trackpad/force") || IS("joystick/click")) return btn(h, VR4_BTN_STICK_CLICK);
+    else if (IS("thumbstick/touch") || IS("trackpad/touch") || IS("joystick/touch")) return btn(h, VR4_BTN_STICK_TOUCH);
+    else if (IS("thumbrest/touch")) return btn(h, VR4_BTN_THUMB_TOUCH);
+    else if (IS("a/touch") || IS("b/touch") || IS("x/touch") || IS("y/touch")) return btn(h, VR4_BTN_THUMB_TOUCH);
+    else if (IS("a/") || IS("x/")) return btn(h, A);
+    else if (IS("b/") || IS("y/")) return btn(h, B);
+    else if (IS("menu") && hand && (kind == K_VIVE || kind == K_WMR || kind == K_SIMPLE)) return btn(h, B);
+    else if (IS("menu") || IS("system")) return btn(h, VR4_BTN_MENU);
+    return strstr(c, "/click") ? v > 0.5f : v;
+    #undef IS
+}
+static int is_pose_comp(const char *c) {
+    return !strcmp(c, "grip/pose") || !strcmp(c, "aim/pose") || !strcmp(c, "palm_ext/pose") || !strcmp(c, "grip_surface/pose") ||
+           !strcmp(c, "pinch_ext/pose") || !strcmp(c, "poke_ext/pose");
+}
+/// Grasp (XR_EXT_hand_interaction grasp_ext) from how far the middle, ring and little fingers are curled.
+static float grasp(int h) {
+    float c = (sxr_curl(&joints[h], 2) + sxr_curl(&joints[h], 3) + sxr_curl(&joints[h], 4)) / 3;
+    c = (c - 0.3f) / 0.45f;
+    return c < 0 ? 0 : c > 1 ? 1 : c;
+}
+/// Values of the hand-interaction profile while the hand is tracked (MacVR sends the pinch as the trigger).
+static float hand_value(int h, const char *c) {
+    #define IS(p) (!strncmp(c, p, strlen(p)))
+    const VR4Hand *v = &track.hand[h];
+    if (IS("pinch_ext/value") || IS("aim_activate_ext/value")) return v->trigger;
+    if (IS("pinch_ext/ready_ext") || IS("aim_activate_ext/ready_ext")) return (v->flags & VR4_HAND_PINCH_READY) || v->trigger > 0.5f;
+    if (IS("grasp_ext/value")) return grasp(h);
+    if (IS("grasp_ext/ready_ext")) return grasp(h) > 0.05f;
     return 0;
     #undef IS
 }
-static int is_pose_comp(const char *c) { return !strcmp(c, "grip/pose") || !strcmp(c, "aim/pose") || !strcmp(c, "palm_ext/pose") || !strcmp(c, "grip_surface/pose"); }
 static int parse_binding(const char *path, Binding *b) {   // "/user/hand/left/input/trigger/value"
     if (!strncmp(path, "/user/hand/left/", 16)) b->hand = 0;
     else if (!strncmp(path, "/user/hand/right/", 17)) b->hand = 1;
@@ -172,8 +224,18 @@ static int sub_matches(XrPath sub, int hand) {
 static XrPosef hand_pose(int hand, const char *comp, int *valid) {
     const VR4Hand *h = &track.hand[hand];
     *valid = (h->flags & VR4_HAND_POSE_VALID) != 0;
+    if (!strcmp(comp, "poke_ext/pose") || !strcmp(comp, "pinch_ext/pose")) {   // hand interaction: index tip / between thumb and index tips
+        const VR4HandJoints *j = &joints[hand];
+        *valid = j->tracked != 0;
+        if (comp[1] == 'o') return xp(j->joint[XR_HAND_JOINT_INDEX_TIP_EXT]);
+        VR4Pose t = j->joint[XR_HAND_JOINT_THUMB_TIP_EXT], i = j->joint[XR_HAND_JOINT_INDEX_TIP_EXT], p = h->aim;
+        p.px = (t.px + i.px) / 2; p.py = (t.py + i.py) / 2; p.pz = (t.pz + i.pz) / 2;
+        return xp(p);
+    }
     return xp(!strcmp(comp, "aim/pose") ? h->aim : h->grip);
 }
+/// A binding counts while its hand is in its profile's mode: hand-interaction bindings while the hand is tracked.
+static int live(const Session *s, const Binding *b) { return b->hp == s->handMode[b->hand]; }
 
 // ---------------------------------------------------------------- spaces
 typedef enum {
@@ -295,7 +357,7 @@ static XrPosef space_in_stage(Space *s, int *valid) {
     }
     for (int i = 0; i < s->action->nb; i++) {
         Binding *b = &s->action->b[i];
-        if (is_pose_comp(b->comp) && sub_matches(s->sub, b->hand)) return pmul(hand_pose(b->hand, b->comp, valid), s->offset);
+        if (is_pose_comp(b->comp) && live((Session *)s->session, b) && sub_matches(s->sub, b->hand)) return pmul(hand_pose(b->hand, b->comp, valid), s->offset);
     }
     *valid = 0;
     return IDENT;
@@ -330,8 +392,8 @@ static void space_velocity_in_stage(Space *s, V *outLinear, V *outAngular, int *
     }
     for (int i = 0; i < s->action->nb; i++) {
         Binding *b = &s->action->b[i];
-        if (is_pose_comp(b->comp) && sub_matches(s->sub, b->hand)) {
-            int isAim = !strcmp(b->comp, "aim/pose");
+        if (is_pose_comp(b->comp) && live((Session *)s->session, b) && sub_matches(s->sub, b->hand)) {
+            int isAim = !strcmp(b->comp, "aim/pose") || !strcmp(b->comp, "pinch_ext/pose");
             TrackSlot slot = (b->hand == 0) ? (isAim ? TRACK_SLOT_HAND_LEFT_AIM : TRACK_SLOT_HAND_LEFT_GRIP)
                                             : (isAim ? TRACK_SLOT_HAND_RIGHT_AIM : TRACK_SLOT_HAND_RIGHT_GRIP);
             VelocityTracker *vt = &velTrackers[slot];
@@ -368,34 +430,61 @@ static void set_local_origin(Session *s) {   // LOCAL = head position at start, 
     for (uint32_t i_ = 0; i_ < (n); i_++) { __VA_ARGS__; } } while (0)
 
 // Compatibility: games refuse to start or wait forever without some of these (BONELAB blocks on XR_FB_display_refresh_rate).
-// Depth / cylinder layers are accepted and ignored; the visibility mask is empty; LOCAL_FLOOR is the local origin on the floor.
-static const char *exts[] = {XR_KHR_METAL_ENABLE_EXTENSION_NAME, XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME,
-                             XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
-                             XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME,
-                             XR_EXT_LOCAL_FLOOR_EXTENSION_NAME, XR_FB_COLOR_SPACE_EXTENSION_NAME,
-                             XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME,
-                             XR_EXT_DEBUG_UTILS_EXTENSION_NAME};   // no XR_EXT_palm_pose: we only have grip/aim, and a fake palm (= grip) made OpenComposite rotate/shift the hands
-static const uint32_t extVer[] = {XR_KHR_metal_enable_SPEC_VERSION, XR_KHR_convert_timespec_time_SPEC_VERSION,
-                                  XR_FB_display_refresh_rate_SPEC_VERSION, XR_KHR_composition_layer_depth_SPEC_VERSION,
-                                  XR_KHR_composition_layer_cylinder_SPEC_VERSION, XR_KHR_visibility_mask_SPEC_VERSION,
-                                  XR_EXT_local_floor_SPEC_VERSION, XR_FB_color_space_SPEC_VERSION,
-                                  XR_KHR_composition_layer_color_scale_bias_SPEC_VERSION,
-                                  XR_EXT_debug_utils_SPEC_VERSION};
+// Depth layers, FB composition-layer settings, local dimming, foveation and performance levels are hints and ignored;
+// LOCAL_FLOOR is the local origin on the floor. The Touch Plus/Pro, Index, Vive, HP, WMR and simple profiles are all
+// fed from the Touch controllers (comp_value). No XR_EXT_palm_pose: a fake palm (= grip) made OpenComposite
+// rotate/shift the hands.
+#define E(n, v) {n, v}
+static const struct { const char *name; uint32_t ver; } exts[] = {
+    E(XR_KHR_METAL_ENABLE_EXTENSION_NAME, XR_KHR_metal_enable_SPEC_VERSION),
+    E(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME, XR_KHR_convert_timespec_time_SPEC_VERSION),
+    E(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, XR_FB_display_refresh_rate_SPEC_VERSION),
+    E(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME, XR_KHR_composition_layer_depth_SPEC_VERSION),
+    E(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME, XR_KHR_composition_layer_cylinder_SPEC_VERSION),
+    E(XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME, XR_KHR_composition_layer_equirect2_SPEC_VERSION),
+    E(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME, XR_KHR_visibility_mask_SPEC_VERSION),
+    E(XR_EXT_LOCAL_FLOOR_EXTENSION_NAME, XR_EXT_local_floor_SPEC_VERSION),
+    E(XR_FB_COLOR_SPACE_EXTENSION_NAME, XR_FB_color_space_SPEC_VERSION),
+    E(XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME, XR_KHR_composition_layer_color_scale_bias_SPEC_VERSION),
+    E(XR_EXT_DEBUG_UTILS_EXTENSION_NAME, XR_EXT_debug_utils_SPEC_VERSION),
+    E(XR_EXT_HAND_TRACKING_EXTENSION_NAME, XR_EXT_hand_tracking_SPEC_VERSION),
+    E(XR_FB_HAND_TRACKING_AIM_EXTENSION_NAME, XR_FB_hand_tracking_aim_SPEC_VERSION),
+    E(XR_EXT_HAND_INTERACTION_EXTENSION_NAME, XR_EXT_hand_interaction_SPEC_VERSION),
+    E(XR_FB_TOUCH_CONTROLLER_PRO_EXTENSION_NAME, XR_FB_touch_controller_pro_SPEC_VERSION),
+    E(XR_META_TOUCH_CONTROLLER_PLUS_EXTENSION_NAME, XR_META_touch_controller_plus_SPEC_VERSION),
+    E(XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME, XR_EXT_hp_mixed_reality_controller_SPEC_VERSION),
+    E(XR_KHR_LOCATE_SPACES_EXTENSION_NAME, XR_KHR_locate_spaces_SPEC_VERSION),
+    E(XR_EXT_USER_PRESENCE_EXTENSION_NAME, XR_EXT_user_presence_SPEC_VERSION),
+    E(XR_FB_HAPTIC_PCM_EXTENSION_NAME, XR_FB_haptic_pcm_SPEC_VERSION),
+    E(XR_FB_HAPTIC_AMPLITUDE_ENVELOPE_EXTENSION_NAME, XR_FB_haptic_amplitude_envelope_SPEC_VERSION),
+    E(XR_META_PERFORMANCE_METRICS_EXTENSION_NAME, XR_META_performance_metrics_SPEC_VERSION),
+    E(XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME, XR_FB_swapchain_update_state_SPEC_VERSION),
+    E(XR_FB_FOVEATION_EXTENSION_NAME, XR_FB_foveation_SPEC_VERSION),
+    E(XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME, XR_FB_foveation_configuration_SPEC_VERSION),
+    E(XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME, XR_FB_composition_layer_settings_SPEC_VERSION),
+    E(XR_META_LOCAL_DIMMING_EXTENSION_NAME, XR_META_local_dimming_SPEC_VERSION),
+    E(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME, XR_EXT_performance_settings_SPEC_VERSION),
+};
+#undef E
 #define NEXTS (sizeof exts / sizeof *exts)
+static int extOn[NEXTS];   // enabled by the app at xrCreateInstance
+static int enabled(const char *name) { for (size_t i = 0; i < NEXTS; i++) if (!strcmp(exts[i].name, name)) return extOn[i]; return 0; }
 
 static XrResult XRAPI_CALL xrEnumerateApiLayerProperties_(uint32_t cap, uint32_t *n, XrApiLayerProperties *p) { (void)cap; (void)p; *n = 0; return XR_SUCCESS; }
 static XrResult XRAPI_CALL xrEnumerateInstanceExtensionProperties_(const char *layer, uint32_t cap, uint32_t *n, XrExtensionProperties *p) {
     (void)layer;
-    FILL_ARRAY(cap, n, p, (uint32_t)NEXTS, { strcpy(p[i_].extensionName, exts[i_]); p[i_].extensionVersion = extVer[i_]; });
+    FILL_ARRAY(cap, n, p, (uint32_t)NEXTS, { strcpy(p[i_].extensionName, exts[i_].name); p[i_].extensionVersion = exts[i_].ver; });
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_CALL xrCreateInstance_(const XrInstanceCreateInfo *ci, XrInstance *out) {
+    int on[NEXTS] = {0};
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
         int ok = 0;
-        for (size_t j = 0; j < NEXTS; j++) ok |= !strcmp(ci->enabledExtensionNames[i], exts[j]);
+        for (size_t j = 0; j < NEXTS; j++) if (!strcmp(ci->enabledExtensionNames[i], exts[j].name)) ok = on[j] = 1;
         if (!ok) { logmsg("unsupported extension %s", ci->enabledExtensionNames[i]); return XR_ERROR_EXTENSION_NOT_PRESENT; }
     }
+    memcpy(extOn, on, sizeof on);
     if (!shm) {
         const char *path = getenv("VR4MAC_SHM") ? getenv("VR4MAC_SHM") : VR4_SHM_PATH_MAC;   // override for tests
         int fd = open(path, O_RDWR);
@@ -415,9 +504,9 @@ static XrResult XRAPI_CALL xrCreateInstance_(const XrInstanceCreateInfo *ci, XrI
     *out = (XrInstance)(uintptr_t)1;
     return XR_SUCCESS;
 }
-static XrResult XRAPI_CALL xrDestroyInstance_(XrInstance i) { (void)i; return XR_SUCCESS; }
+static XrResult XRAPI_CALL xrDestroyInstance_(XrInstance i) { (void)i; nsugg = 0; return XR_SUCCESS; }   // suggestions are per instance
 static XrResult XRAPI_CALL xrGetInstanceProperties_(XrInstance i, XrInstanceProperties *p) {
-    (void)i; p->runtimeVersion = XR_MAKE_VERSION(0, 2, 0); strcpy(p->runtimeName, "SiliconXR"); return XR_SUCCESS;
+    (void)i; p->runtimeVersion = XR_MAKE_VERSION(1, 0, 0); strcpy(p->runtimeName, "SiliconXR"); return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrPollEvent_(XrInstance i, XrEventDataBuffer *e) {
     (void)i;
@@ -425,6 +514,20 @@ static XrResult XRAPI_CALL xrPollEvent_(XrInstance i, XrEventDataBuffer *e) {
     if (s && s->running && !s->exitRequested) {   // dashboard open on the Mac side = app loses input focus
         int focused = !shm->input_blocked;
         if (focused != s->focused) { s->focused = focused; push_state(focused ? XR_SESSION_STATE_FOCUSED : XR_SESSION_STATE_VISIBLE); }
+        int present = shm->client_connected != 0;   // XR_EXT_user_presence: the headset is linked to MacVR
+        if (present != s->present && enabled(XR_EXT_USER_PRESENCE_EXTENSION_NAME)) {
+            s->present = present;
+            XrEventDataUserPresenceChangedEXT *u = (XrEventDataUserPresenceChangedEXT *)push_event(XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT);
+            u->session = (XrSession)s; u->isUserPresent = present;
+        }
+        static VR4Fov maskFov[2];   // the visibility mask follows the eye's field of view (it arrives with tracking)
+        for (int v = 0; v < 2 && enabled(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME); v++) {
+            VR4Fov f = frame_eye(&frameTrack, v).fov;
+            if (!memcmp(&f, &maskFov[v], sizeof f)) continue;
+            maskFov[v] = f;
+            XrEventDataVisibilityMaskChangedKHR *m = (XrEventDataVisibilityMaskChangedKHR *)push_event(XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR);
+            m->session = (XrSession)s; m->viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO; m->viewIndex = (uint32_t)v;
+        }
     }
     if (evHead == evTail) return XR_EVENT_UNAVAILABLE;
     memcpy(e, &events[evHead++ % 64], sizeof *e);
@@ -470,9 +573,9 @@ static XrResult XRAPI_CALL xrGetSystemProperties_(XrInstance i, XrSystemId id, X
     p->graphicsProperties.maxLayerCount = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
     p->trackingProperties.orientationTracking = XR_TRUE; p->trackingProperties.positionTracking = XR_TRUE;
     for (XrBaseOutStructure *next = (XrBaseOutStructure *)p->next; next; next = next->next) {
-        if (next->type == XR_TYPE_SYSTEM_COLOR_SPACE_PROPERTIES_FB) {
-            ((XrSystemColorSpacePropertiesFB *)next)->colorSpace = XR_COLOR_SPACE_QUEST_FB;
-        }
+        if (next->type == XR_TYPE_SYSTEM_COLOR_SPACE_PROPERTIES_FB) ((XrSystemColorSpacePropertiesFB *)next)->colorSpace = XR_COLOR_SPACE_QUEST_FB;
+        if (next->type == XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT) ((XrSystemHandTrackingPropertiesEXT *)next)->supportsHandTracking = XR_TRUE;
+        if (next->type == XR_TYPE_SYSTEM_USER_PRESENCE_PROPERTIES_EXT) ((XrSystemUserPresencePropertiesEXT *)next)->supportsUserPresence = XR_TRUE;
     }
     return XR_SUCCESS;
 }
@@ -530,7 +633,7 @@ static XrResult XRAPI_CALL xrCreateSession_(XrInstance i, const XrSessionCreateI
         if (b->type == XR_TYPE_GRAPHICS_BINDING_METAL_KHR) gb = (const XrGraphicsBindingMetalKHR *)b;
     if (!gb || !gb->commandQueue) { logmsg("xrCreateSession: only Metal is supported"); return XR_ERROR_GRAPHICS_DEVICE_INVALID; }
     Session *s = calloc(1, sizeof *s);
-    s->queue = [(id<MTLCommandQueue>)gb->commandQueue retain];
+    s->queue = [(id<MTLCommandQueue>)gb->commandQueue retain]; s->present = -1;
     read_tracking(); frameTrack = track; set_local_origin(s);
     theSession = s;
     *out = (XrSession)s;
@@ -543,6 +646,7 @@ static XrResult XRAPI_CALL xrDestroySession_(XrSession h) {
     id<MTLCommandBuffer> drain = [s->queue commandBuffer]; [drain commit]; [drain waitUntilCompleted];   // queue is in order
     dispatch_sync(publish_queue(), ^{});                                                                  // and pending publishes
     for (int k = 0; k < NRING; k++) [s->ring[k] release];
+    [s->comp release];
     [s->queue release];
     if (theSession == s) theSession = NULL;
     free(s);
@@ -627,6 +731,8 @@ static XrResult XRAPI_CALL xrDestroySpace_(XrSpace s) { free(s); return XR_SUCCE
 
 // ---------------------------------------------------------------- frames
 static int64_t endSum, copySum;   // pacing log: time inside xrEndFrame / in the CPU readback copy
+static float gameMs;              // XR_META_performance_metrics: smoothed game time per frame (ms)
+static uint32_t droppedFrames;    // frames not streamed because every readback buffer was still busy
 static XrResult XRAPI_CALL xrWaitFrame_(XrSession h, const XrFrameWaitInfo *wi, XrFrameState *fs) {
     (void)wi; (void)h;
     float fps = shm->fps > 0 ? shm->fps : 72;
@@ -656,7 +762,7 @@ static XrResult XRAPI_CALL xrWaitFrame_(XrSession h, const XrFrameWaitInfo *wi, 
     fs->shouldRender = XR_TRUE;
     // pacing diagnostics every 5 s: time blocked here vs time the game spends between frames (render+submit+present)
     int64_t exitNs = qpc_ns();
-    if (lastExit) { waitSum += exitNs - start; workSum += start - lastExit; statN++; }
+    if (lastExit) { waitSum += exitNs - start; workSum += start - lastExit; statN++; gameMs += ((start - lastExit) / 1e6f - gameMs) * 0.1f; }
     lastExit = exitNs;
     if (!statStart) statStart = exitNs;
     if (exitNs - statStart > 5000000000LL && statN) {
@@ -668,6 +774,10 @@ static XrResult XRAPI_CALL xrWaitFrame_(XrSession h, const XrFrameWaitInfo *wi, 
 }
 static XrResult XRAPI_CALL xrBeginFrame_(XrSession h, const XrFrameBeginInfo *bi) { (void)h; (void)bi; return XR_SUCCESS; }
 
+static VR4Eye frame_eye(const VR4Tracking *ft, int e) {
+    VR4Eye d = {{e ? 0.032f : -0.032f, 1.6f, 0, 0, 0, 0, 1}, {-0.8f, 0.8f, 0.8f, -0.8f}};   // no headset yet
+    return ft->time_ns ? ft->eye[e] : d;
+}
 static XrResult XRAPI_CALL xrLocateViews_(XrSession h, const XrViewLocateInfo *li, XrViewState *vs, uint32_t cap, uint32_t *n, XrView *views) {
     (void)h;
     int valid;
@@ -676,10 +786,9 @@ static XrResult XRAPI_CALL xrLocateViews_(XrSession h, const XrViewLocateInfo *l
     vs->viewStateFlags = valid ? (XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT |
                                   XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT) : 0;
     FILL_ARRAY(cap, n, views, 2, {
-        VR4Eye d = {{i_ ? 0.032f : -0.032f, 1.6f, 0, 0, 0, 0, 1}, {-0.8f, 0.8f, 0.8f, -0.8f}};   // no headset yet
-        const VR4Eye *e = ft->time_ns ? &ft->eye[i_] : &d;
-        views[i_].pose = pmul(pinv(base), xp(e->pose));
-        views[i_].fov = (XrFovf){e->fov.left, e->fov.right, e->fov.up, e->fov.down};
+        VR4Eye e = frame_eye(ft, (int)i_);
+        views[i_].pose = pmul(pinv(base), xp(e.pose));
+        views[i_].fov = (XrFovf){e.fov.left, e.fov.right, e.fov.up, e.fov.down};
     });
     return XR_SUCCESS;
 }
@@ -710,12 +819,13 @@ static int ring_slot(Session *s, size_t size) {
     return -1;   // GPU still owns every buffer: drop this frame rather than block
 }
 /// Copies `n` w x h regions into one ring buffer (`row` bytes per row, region e at byte e*w*4), then runs `done` with
-/// the bytes on the publish queue. Returns 0 if no buffer was free.
-static int readback(Session *s, int n, id<MTLTexture> const *tex, const uint32_t *slice, const MTLOrigin *org, uint32_t w, uint32_t h,
-                    size_t row, void (^done)(const uint8_t *)) {
+/// the bytes on the publish queue. `cb` may already hold GPU work (the compositor's pass); nil makes a new one.
+/// Returns 0 if no buffer was free (the frame is dropped and `cb` is never committed).
+static int readback(Session *s, id<MTLCommandBuffer> cb, int n, id<MTLTexture> const *tex, const uint32_t *slice, const MTLOrigin *org,
+                    uint32_t w, uint32_t h, size_t row, void (^done)(const uint8_t *)) {
     int k = ring_slot(s, row * h);
-    if (k < 0) return 0;
-    id<MTLCommandBuffer> cb = [s->queue commandBuffer];
+    if (k < 0) { droppedFrames++; return 0; }
+    if (!cb) cb = [s->queue commandBuffer];
     id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
     for (int e = 0; e < n; e++)
         [bl copyFromTexture:tex[e] sourceSlice:slice[e] sourceLevel:0 sourceOrigin:org[e] sourceSize:MTLSizeMake(w, h, 1)
@@ -746,56 +856,242 @@ static void publish(uint32_t buf, uint32_t fw, uint32_t fh, int rgba, uint64_t t
 static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi);
 static XrResult XRAPI_CALL xrEndFrame_(XrSession h, const XrFrameEndInfo *fi) {
     int64_t endT0 = qpc_ns();
-    XrResult r = xrEndFrameImpl(h, fi);
+    XrResult r;
+    @autoreleasepool { r = xrEndFrameImpl(h, fi); }   // Metal objects made per frame; the game thread may have no pool
     endSum += qpc_ns() - endT0;
     return r;
 }
-// Fallback for apps that submit quad layers without a stereo projection (menus, media players):
-// letterbox the first quad into both eyes so the headset shows something instead of a stale frame.
-static XrResult XRAPI_CALL endFrameQuad(Session *s, const XrFrameEndInfo *fi) {
-    const XrCompositionLayerQuad *q = NULL;
-    for (uint32_t i = 0; i < fi->layerCount; i++)
-        if (fi->layers[i] && fi->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) { q = (const XrCompositionLayerQuad *)fi->layers[i]; break; }
-    if (!q) {
-        static int warned_eq;
-        for (uint32_t i = 0; i < fi->layerCount; i++)
-            if (fi->layers[i] && fi->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR && !warned_eq++)
-                logmsg("equirect layers are not composited yet");
-        return XR_SUCCESS;
+// ---------------------------------------------------------------- compositor
+// Frames with more than one plain projection layer (quads, cylinders, equirect2, color scale/bias, or no projection
+// at all: menus, video players) are drawn into s->comp, both eyes side by side, then read back like a projection.
+// One full-screen pass per layer and eye: the fragment shader casts the pixel's view ray into the layer (quad plane,
+// cylinder, sphere) and samples it; projection layers are sampled straight. Layer flags pick the blending.
+static const char *shaderSrc =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct L { float4 tan, vp, r0, r1, r2, t, p, uv, scale, bias; int type, slice, pad0, pad1; };\n"
+    "struct VO { float4 pos [[position]]; };\n"
+    "vertex VO vs(uint id [[vertex_id]]) { VO o; float2 c = float2((id << 1) & 2, id & 2); o.pos = float4(c * 2 - 1, 0, 1); return o; }\n"
+    "static bool hit(constant L &l, float2 px, thread float2 &uv) {\n"
+    "    float2 f = (px - l.vp.xy) / l.vp.zw, q;\n"
+    "    if (l.type == 3) { uv = l.uv.xy + f * l.uv.zw; return true; }\n"
+    "    float3 d = float3(mix(l.tan.x, l.tan.y, f.x), mix(l.tan.z, l.tan.w, f.y), -1);\n"
+    "    float3 o = l.t.xyz, r = float3(dot(l.r0.xyz, d), dot(l.r1.xyz, d), dot(l.r2.xyz, d));\n"
+    "    if (l.type == 0) {\n"   // quad: its XY plane, size p.xy, visible from both sides
+    "        if (abs(r.z) < 1e-6) return false;\n"
+    "        float s = -o.z / r.z; if (s <= 0) return false;\n"
+    "        float3 h = o + s * r; q = float2(h.x / l.p.x + 0.5, 0.5 - h.y / l.p.y);\n"
+    "    } else if (l.type == 1) {\n"   // cylinder around +Y: radius p.x, arc p.y centered on -Z, aspect p.z
+    "        float a = dot(r.xz, r.xz), b = dot(o.xz, r.xz), c = dot(o.xz, o.xz) - l.p.x * l.p.x, disc = b * b - a * c;\n"
+    "        if (a < 1e-9 || disc < 0) return false;\n"
+    "        float height = l.p.x * l.p.y / l.p.z; bool found = false;\n"
+    "        for (int k = 0; k < 2 && !found; k++) {\n"
+    "            float s = (-b + (k ? 1 : -1) * sqrt(disc)) / a; float3 h = o + s * r; float th = atan2(h.x, -h.z);\n"
+    "            if (s > 0 && abs(th) <= l.p.y * 0.5 && abs(h.y) <= height * 0.5) { q = float2(th / l.p.y + 0.5, 0.5 - h.y / height); found = true; }\n"
+    "        }\n"
+    "        if (!found) return false;\n"
+    "    } else {\n"   // equirect2: sphere radius p.x (0 = infinite), horizontal angle p.y, upper p.z / lower p.w latitude
+    "        float3 v = r;\n"
+    "        if (l.p.x > 0) {\n"
+    "            float a = dot(r, r), b = dot(o, r), c = dot(o, o) - l.p.x * l.p.x, disc = b * b - a * c;\n"
+    "            if (disc < 0) return false;\n"
+    "            float s = (-b + sqrt(disc)) / a; if (s <= 0) return false;\n"
+    "            v = o + s * r;\n"
+    "        }\n"
+    "        v = normalize(v); float lon = atan2(v.x, -v.z), lat = asin(clamp(v.y, -1.0, 1.0));\n"
+    "        if (abs(lon) > l.p.y * 0.5 || lat > l.p.z || lat < l.p.w) return false;\n"
+    "        q = float2(lon / l.p.y + 0.5, (l.p.z - lat) / (l.p.z - l.p.w));\n"
+    "    }\n"
+    "    if (any(q < 0) || any(q > 1)) return false;\n"
+    "    uv = l.uv.xy + q * l.uv.zw; return true;\n"
+    "}\n"
+    "constexpr sampler sm(filter::linear, address::clamp_to_edge);\n"
+    "fragment float4 fs2d(VO in [[stage_in]], constant L &l [[buffer(0)]], texture2d<float> t [[texture(0)]]) {\n"
+    "    float2 uv; if (!hit(l, in.pos.xy, uv)) { discard_fragment(); return 0; }\n"
+    "    return t.sample(sm, uv) * l.scale + l.bias;\n"
+    "}\n"
+    "fragment float4 fsArray(VO in [[stage_in]], constant L &l [[buffer(0)]], texture2d_array<float> t [[texture(0)]]) {\n"
+    "    float2 uv; if (!hit(l, in.pos.xy, uv)) { discard_fragment(); return 0; }\n"
+    "    return t.sample(sm, uv, l.slice) * l.scale + l.bias;\n"
+    "}\n";
+typedef struct { float tan[4], vp[4], r0[4], r1[4], r2[4], t[4], p[4], uv[4], scale[4], bias[4]; int32_t type, slice, pad[2]; } LayerU;
+enum { L_QUAD, L_CYLINDER, L_EQUIRECT, L_PROJECTION };
+
+/// Render pipeline for the composition target format, blend mode (0 opaque, 1 premultiplied, 2 unpremultiplied
+/// alpha) and texture type (array or not). Built on first use and cached.
+static id<MTLRenderPipelineState> pipeline(id<MTLDevice> dev, MTLPixelFormat fmt, int blend, int array) {
+    static id<MTLDevice> libDev; static id<MTLLibrary> lib;
+    static struct { MTLPixelFormat fmt; int blend, array; id<MTLRenderPipelineState> ps; } cache[24]; static int n;
+    if (dev != libDev) {   // new GPU: start over
+        for (int i = 0; i < n; i++) [cache[i].ps release];
+        [lib release]; lib = nil; n = 0; libDev = dev;
+        NSError *err = nil;
+        lib = [dev newLibraryWithSource:@(shaderSrc) options:nil error:&err];
+        if (!lib) logmsg("compositor shader: %s", err.localizedDescription.UTF8String);
     }
-    Swapchain *sc = find_sc(q->subImage.swapchain);
-    if (!sc || sc->released < 0) return XR_SUCCESS;
-    uint32_t sw = (uint32_t)q->subImage.imageRect.extent.width, sh = (uint32_t)q->subImage.imageRect.extent.height;
-    int32_t ox = q->subImage.imageRect.offset.x, oy = q->subImage.imageRect.offset.y;
-    if (!sw || !sh || ox < 0 || oy < 0 || (uint32_t)ox + sw > sc->w || (uint32_t)oy + sh > sc->h ||
-        q->subImage.imageArrayIndex >= sc->array) return XR_SUCCESS;
-    id<MTLTexture> tex[1] = {sc->img[sc->released]};
-    uint32_t slice[1] = {q->subImage.imageArrayIndex};
-    MTLOrigin org[1] = {MTLOriginMake((NSUInteger)ox, (NSUInteger)oy, 0)};
-    int rgba = is_rgba(sc->fmt);
-    Pose2 pose = {{frameTrack.head, frameTrack.head}};
-    uint64_t t = (uint64_t)fi->displayTime;
-    readback(s, 1, tex, slice, org, sw, sh, (size_t)sw * 4, ^(const uint8_t *src) {
-        uint32_t dw = eye_w(), dh = eye_h();
-        if (2ULL * dw * dh * 4ULL > (uint64_t)VR4_FRAME_MAX) return;
-        uint32_t buf = (shm->frame_seq + 1) % 2;
-        uint8_t *dst = vr4_frame(shm, buf);
-        float scf = (float)dw / sw < (float)dh / sh ? (float)dw / sw : (float)dh / sh;
-        uint32_t tw = (uint32_t)(sw * scf), th = (uint32_t)(sh * scf);
-        if (!tw) tw = 1;
-        if (!th) th = 1;
-        if (tw > dw) tw = dw;
-        if (th > dh) th = dh;
-        uint32_t x0 = (dw - tw) / 2, y0 = (dh - th) / 2;
-        memset(dst, 0, (size_t)2 * dw * dh * 4);
-        for (uint32_t y = 0; y < th; y++) {
-            const uint32_t *row = (const uint32_t *)(src + (size_t)(y * sh / th) * sw * 4);
-            for (int e = 0; e < 2; e++) {
-                uint32_t *out = (uint32_t *)(dst + ((size_t)(y0 + y) * 2 * dw + (size_t)e * dw + x0) * 4);
-                for (uint32_t x = 0; x < tw; x++) out[x] = row[x * sw / tw];
-            }
+    for (int i = 0; i < n; i++) if (cache[i].fmt == fmt && cache[i].blend == blend && cache[i].array == array) return cache[i].ps;
+    if (!lib || n == 24) return nil;
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    id<MTLFunction> vs = [lib newFunctionWithName:@"vs"], fs = [lib newFunctionWithName:array ? @"fsArray" : @"fs2d"];
+    d.vertexFunction = vs; d.fragmentFunction = fs;
+    MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[0];
+    c.pixelFormat = fmt;
+    if (blend) {
+        c.blendingEnabled = YES;
+        c.sourceRGBBlendFactor = blend == 2 ? MTLBlendFactorSourceAlpha : MTLBlendFactorOne;
+        c.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        c.sourceAlphaBlendFactor = MTLBlendFactorOne; c.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    }
+    NSError *err = nil;
+    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!ps) logmsg("compositor pipeline: %s", err.localizedDescription.UTF8String);
+    else { cache[n].fmt = fmt; cache[n].blend = blend; cache[n].array = array; cache[n++].ps = ps; }
+    [vs release]; [fs release]; [d release];
+    return ps;
+}
+static const XrCompositionLayerColorScaleBiasKHR *scale_bias(const XrCompositionLayerBaseHeader *l) {
+    for (const XrBaseInStructure *n = l->next; n; n = n->next)
+        if (n->type == XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR) return (const XrCompositionLayerColorScaleBiasKHR *)n;
+    return NULL;
+}
+/// The released image of a layer's sub-image, if the rect and array index fit its swapchain.
+static Swapchain *sub_image(const XrSwapchainSubImage *si) {
+    Swapchain *sc = find_sc(si->swapchain);
+    if (!sc || sc->released < 0 || si->imageRect.offset.x < 0 || si->imageRect.offset.y < 0 || si->imageRect.extent.width <= 0 ||
+        si->imageRect.extent.height <= 0 || (uint32_t)(si->imageRect.offset.x + si->imageRect.extent.width) > sc->w ||
+        (uint32_t)(si->imageRect.offset.y + si->imageRect.extent.height) > sc->h || si->imageArrayIndex >= sc->array) return NULL;
+    return sc;
+}
+static int color_format(MTLPixelFormat f) {
+    return f == MTLPixelFormatBGRA8Unorm_sRGB || f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatRGBA8Unorm;
+}
+static XrResult composite(Session *s, const XrFrameEndInfo *fi, const XrCompositionLayerProjection *proj) {
+    uint32_t w = eye_w(), h = eye_h();
+    MTLPixelFormat fmt = MTLPixelFormatBGRA8Unorm_sRGB;
+    if (proj && proj->viewCount >= 2) {   // the projection sets the frame size and format
+        Swapchain *sc = sub_image(&proj->views[0].subImage);
+        if (sc) { w = (uint32_t)proj->views[0].subImage.imageRect.extent.width; h = (uint32_t)proj->views[0].subImage.imageRect.extent.height; }
+        if (sc && color_format(sc->fmt)) fmt = sc->fmt;
+    } else proj = NULL;
+    if (2ULL * w * h * 4ULL > (uint64_t)VR4_FRAME_MAX) return XR_SUCCESS;
+
+    // Eyes in stage space: the projection's views if there is one, else this frame's tracked eyes.
+    const VR4Tracking *ft = frame_for(fi->displayTime);
+    int valid;
+    XrPosef projSpace = proj ? space_in_stage((Space *)proj->space, &valid) : IDENT, eye[2];
+    float tn[2][4]; Pose2 pose;
+    for (int e = 0; e < 2; e++) {
+        XrFovf fov;
+        if (proj) {
+            eye[e] = pmul(projSpace, proj->views[e].pose); fov = proj->views[e].fov;
+            XrPosef v = proj->views[e].pose;
+            pose.p[e] = (VR4Pose){v.position.x, v.position.y, v.position.z, v.orientation.x, v.orientation.y, v.orientation.z, v.orientation.w};
+        } else {
+            VR4Eye fe = frame_eye(ft, e);
+            eye[e] = xp(fe.pose); fov = (XrFovf){fe.fov.left, fe.fov.right, fe.fov.up, fe.fov.down}; pose.p[e] = fe.pose;
         }
-        publish(buf, 2 * dw, dh, rgba, t, pose);
+        tn[e][0] = tanf(fov.angleLeft); tn[e][1] = tanf(fov.angleRight); tn[e][2] = tanf(fov.angleUp); tn[e][3] = tanf(fov.angleDown);
+    }
+
+    typedef struct { LayerU u[2]; id<MTLTexture> tex[2]; id<MTLRenderPipelineState> ps[2]; } Draw;
+    Draw draws[XR_MIN_COMPOSITION_LAYERS_SUPPORTED]; int nd = 0;
+    id<MTLDevice> dev = s->queue.device;
+    for (uint32_t i = 0; i < fi->layerCount && nd < XR_MIN_COMPOSITION_LAYERS_SUPPORTED; i++) {
+        const XrCompositionLayerBaseHeader *l = fi->layers[i];
+        if (!l) continue;
+        const XrSwapchainSubImage *si[2] = {NULL, NULL}; XrPosef lp = IDENT; float p[4] = {0}; int type, eyes = 3;
+        XrEyeVisibility vis = XR_EYE_VISIBILITY_BOTH;
+        switch (l->type) {
+        case XR_TYPE_COMPOSITION_LAYER_PROJECTION: {
+            const XrCompositionLayerProjection *pl = (const XrCompositionLayerProjection *)l;
+            if (pl->viewCount < 2) continue;
+            type = L_PROJECTION; si[0] = &pl->views[0].subImage; si[1] = &pl->views[1].subImage; break;
+        }
+        case XR_TYPE_COMPOSITION_LAYER_QUAD: {
+            const XrCompositionLayerQuad *q = (const XrCompositionLayerQuad *)l;
+            type = L_QUAD; si[0] = si[1] = &q->subImage; lp = q->pose; vis = q->eyeVisibility;
+            p[0] = q->size.width; p[1] = q->size.height; break;
+        }
+        case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR: {
+            const XrCompositionLayerCylinderKHR *c = (const XrCompositionLayerCylinderKHR *)l;
+            type = L_CYLINDER; si[0] = si[1] = &c->subImage; lp = c->pose; vis = c->eyeVisibility;
+            p[0] = c->radius; p[1] = c->centralAngle; p[2] = c->aspectRatio; break;
+        }
+        case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR: {
+            const XrCompositionLayerEquirect2KHR *q = (const XrCompositionLayerEquirect2KHR *)l;
+            type = L_EQUIRECT; si[0] = si[1] = &q->subImage; lp = q->pose; vis = q->eyeVisibility;
+            p[0] = isinf(q->radius) ? 0 : q->radius; p[1] = q->centralHorizontalAngle; p[2] = q->upperVerticalAngle; p[3] = q->lowerVerticalAngle; break;
+        }
+        default: {
+            static int warned; if (!warned++) logmsg("layer type %d is not composited", l->type);
+            continue;
+        }
+        }
+        if (vis == XR_EYE_VISIBILITY_LEFT) eyes = 1; else if (vis == XR_EYE_VISIBILITY_RIGHT) eyes = 2;
+        if (type == L_CYLINDER && (p[0] <= 0 || p[1] <= 0 || p[2] <= 0)) continue;
+        if (type == L_QUAD && (p[0] <= 0 || p[1] <= 0)) continue;
+        int blend = l->layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+                    ? (l->layerFlags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT ? 2 : 1) : 0;
+        const XrCompositionLayerColorScaleBiasKHR *cb = scale_bias(l);
+        XrPosef layer = pmul(space_in_stage((Space *)l->space, &valid), lp);
+        Draw *d = &draws[nd]; memset(d, 0, sizeof *d);
+        int ok = 1;
+        for (int e = 0; e < 2; e++) {
+            Swapchain *sc = sub_image(si[e]);
+            if (!sc || !(eyes >> e & 1)) { if (!sc) ok = 0; continue; }
+            LayerU *u = &d->u[e];
+            memcpy(u->tan, tn[e], sizeof u->tan);
+            u->vp[0] = (float)(e * w); u->vp[2] = (float)w; u->vp[3] = (float)h;
+            XrPosef rel = pmul(pinv(layer), eye[e]);   // eye in layer space
+            Q q = rel.orientation;
+            float r[3][3] = {{1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y - q.z * q.w), 2 * (q.x * q.z + q.y * q.w)},
+                             {2 * (q.x * q.y + q.z * q.w), 1 - 2 * (q.x * q.x + q.z * q.z), 2 * (q.y * q.z - q.x * q.w)},
+                             {2 * (q.x * q.z - q.y * q.w), 2 * (q.y * q.z + q.x * q.w), 1 - 2 * (q.x * q.x + q.y * q.y)}};
+            memcpy(u->r0, r[0], 12); memcpy(u->r1, r[1], 12); memcpy(u->r2, r[2], 12);
+            u->t[0] = rel.position.x; u->t[1] = rel.position.y; u->t[2] = rel.position.z;
+            memcpy(u->p, p, sizeof p);
+            u->uv[0] = (float)si[e]->imageRect.offset.x / sc->w; u->uv[1] = (float)si[e]->imageRect.offset.y / sc->h;
+            u->uv[2] = (float)si[e]->imageRect.extent.width / sc->w; u->uv[3] = (float)si[e]->imageRect.extent.height / sc->h;
+            for (int k = 0; k < 4; k++) {
+                u->scale[k] = cb ? (&cb->colorScale.r)[k] : 1; u->bias[k] = cb ? (&cb->colorBias.r)[k] : 0;
+            }
+            u->type = type; u->slice = (int32_t)si[e]->imageArrayIndex;
+            d->tex[e] = sc->img[sc->released];
+            if (!(d->ps[e] = pipeline(dev, fmt, blend, sc->array > 1))) ok = 0;
+        }
+        if (ok) nd++;
+    }
+    if (!nd) return XR_SUCCESS;
+
+    if (!s->comp || s->comp.width != 2 * w || s->comp.height != h || s->comp.pixelFormat != fmt) {
+        [s->comp release];   // frames still in flight keep their own reference
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:2 * w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+        if (!(s->comp = [dev newTextureWithDescriptor:td])) return XR_SUCCESS;
+    }
+    id<MTLCommandBuffer> cmd = [s->queue commandBuffer];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = s->comp; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    for (int i = 0; i < nd; i++)
+        for (int e = 0; e < 2; e++) {
+            if (!draws[i].tex[e]) continue;
+            [enc setRenderPipelineState:draws[i].ps[e]];
+            [enc setViewport:(MTLViewport){(double)e * w, 0, w, h, 0, 1}];
+            [enc setFragmentBytes:&draws[i].u[e] length:sizeof(LayerU) atIndex:0];
+            [enc setFragmentTexture:draws[i].tex[e] atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+    [enc endEncoding];
+    id<MTLTexture> tex[1] = {s->comp}; uint32_t slice[1] = {0}; MTLOrigin org[1] = {MTLOriginMake(0, 0, 0)};
+    int rgba = is_rgba(fmt);
+    uint64_t t = (uint64_t)fi->displayTime;
+    uint32_t fw = 2 * w, fh = h;
+    readback(s, cmd, 1, tex, slice, org, fw, fh, (size_t)fw * 4, ^(const uint8_t *src) {
+        uint32_t buf = (shm->frame_seq + 1) % 2;
+        memcpy(vr4_frame(shm, buf), src, (size_t)fw * fh * 4);
+        publish(buf, fw, fh, rgba, t, pose);
     });
     s->lastPublished = t;
     shm->runtime_heartbeat_ns = (uint64_t)qpc_ns();
@@ -821,7 +1117,8 @@ static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi)
                    si->imageRect.extent.width, si->imageRect.extent.height, si->imageArrayIndex);
         }
     }
-    if (!proj || proj->viewCount < 2) return endFrameQuad(s, fi);   // no stereo projection: quad fallback or nothing
+    // Anything but one plain projection (extra layers, color scale/bias, no projection) goes through the compositor.
+    if (!proj || proj->viewCount < 2 || fi->layerCount != 1 || scale_bias((const XrCompositionLayerBaseHeader *)proj)) return composite(s, fi, proj);
 
     Swapchain *sc[2] = { find_sc(proj->views[0].subImage.swapchain), find_sc(proj->views[1].subImage.swapchain) };
     if (!sc[0] || !sc[1]) {
@@ -831,17 +1128,13 @@ static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi)
     if (sc[0]->released < 0 || sc[1]->released < 0) return XR_SUCCESS;
 
     uint64_t w = (uint64_t)proj->views[0].subImage.imageRect.extent.width, hgt = (uint64_t)proj->views[0].subImage.imageRect.extent.height;
-    if (!w || !hgt || (uint64_t)proj->views[1].subImage.imageRect.extent.width != w || (uint64_t)proj->views[1].subImage.imageRect.extent.height != hgt ||
-        2ULL * w * hgt * 4ULL > (uint64_t)VR4_FRAME_MAX) {
-        static int warned; if (!warned++) logmsg("unsupported eye rects %llux%llu / %dx%d", (unsigned long long)w, (unsigned long long)hgt, proj->views[1].subImage.imageRect.extent.width, proj->views[1].subImage.imageRect.extent.height);
+    if (!w || !hgt || 2ULL * w * hgt * 4ULL > (uint64_t)VR4_FRAME_MAX) {
+        static int warned; if (!warned++) logmsg("unsupported eye rect %llux%llu", (unsigned long long)w, (unsigned long long)hgt);
         return XR_SUCCESS;
     }
-
     MTLPixelFormat fmt = sc[0]->fmt;
-    if (sc[1]->fmt != fmt) {
-        static int warned_fmt; if (!warned_fmt++) logmsg("mismatched swapchain formats between eyes: %d vs %d", sc[0]->fmt, sc[1]->fmt);
-        return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
-    }
+    if ((uint64_t)proj->views[1].subImage.imageRect.extent.width != w || (uint64_t)proj->views[1].subImage.imageRect.extent.height != hgt ||
+        sc[1]->fmt != fmt) return composite(s, fi, proj);   // eyes differ in size or format: resample them
 
     // Bounds checking for rects and array indices against swapchain metadata
     for (int e = 0; e < 2; e++) {
@@ -870,7 +1163,7 @@ static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi)
     uint64_t t = (uint64_t)fi->displayTime;
     uint32_t fw = 2 * (uint32_t)w, fh = (uint32_t)hgt;
     int64_t copyT0 = qpc_ns();
-    readback(s, 2, tex, slice, org, (uint32_t)w, (uint32_t)hgt, (size_t)fw * 4, ^(const uint8_t *src) {
+    readback(s, nil, 2, tex, slice, org, (uint32_t)w, (uint32_t)hgt, (size_t)fw * 4, ^(const uint8_t *src) {
         uint32_t buf = (shm->frame_seq + 1) % 2;
         memcpy(vr4_frame(shm, buf), src, (size_t)fw * fh * 4);   // channel order fixed up on the Mac (frame_rgba)
         publish(buf, fw, fh, rgba, t, pose);
@@ -951,49 +1244,55 @@ static XrResult XRAPI_CALL xrCreateAction_(XrActionSet set, const XrActionCreate
 static XrResult XRAPI_CALL xrDestroyAction_(XrAction a) { (void)a; return XR_SUCCESS; }   // may still be referenced by suggestions
 static XrResult XRAPI_CALL xrSuggestInteractionProfileBindings_(XrInstance i, const XrInteractionProfileSuggestedBinding *sb) {
     (void)i;
+    int n = 0;   // a new suggestion for a profile replaces the previous one
+    for (int k = 0; k < nsugg; k++) if (sugg[k].profile != sb->interactionProfile) sugg[n++] = sugg[k];
+    nsugg = n;
     for (uint32_t k = 0; k < sb->countSuggestedBindings && nsugg < 1024; k++)
         sugg[nsugg++] = (Suggestion){sb->interactionProfile, (Action *)sb->suggestedBindings[k].action, sb->suggestedBindings[k].binding};
     return XR_SUCCESS;
 }
+static void push_profile_changed(Session *s) {
+    ((XrEventDataInteractionProfileChanged *)push_event(XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED))->session = (XrSession)s;
+}
+/// Binds the app's best-ranked controller profile (all of them are fed from the Touch controllers) and, if suggested,
+/// XR_EXT_hand_interaction, which takes over a hand while it is hand-tracked.
 static XrResult XRAPI_CALL xrAttachSessionActionSets_(XrSession h, const XrSessionActionSetsAttachInfo *ai) {
     Session *s = (Session *)h; (void)ai;
-    XrPath touch = intern("/interaction_profiles/oculus/touch_controller");
-    XrPath touchPlus = intern("/interaction_profiles/meta/touch_controller_plus");
-    XrPath touchPro = intern("/interaction_profiles/meta/touch_pro_controller");
-    XrPath index = intern("/interaction_profiles/valve/index_controller");
-    XrPath simple = intern("/interaction_profiles/khr/simple_controller");
-
-    XrPath best = XR_NULL_PATH;
-    for (int k = 0; k < nsugg; k++) {
-        if (sugg[k].profile == touch) { best = touch; break; }
-        if (sugg[k].profile == touchPlus && (!best || best == simple)) best = touchPlus;
-        if (sugg[k].profile == touchPro && (!best || best == simple)) best = touchPro;
-        if (sugg[k].profile == index && (!best || best == simple)) best = index;
-        if (!best && sugg[k].profile != simple) best = sugg[k].profile;
-    }
-    s->profile = best ? best : (nsugg ? sugg[0].profile : touch);
+    XrPath hand = intern(HAND_PROFILE), best = XR_NULL_PATH;
+    for (int k = 0; k < nsugg; k++)
+        if (sugg[k].profile != hand && (!best || profile_index(sugg[k].profile) < profile_index(best))) best = sugg[k].profile;
+    s->profile = best ? best : intern(profileTable[0].path);
+    s->kind = profile_kind(s->profile);
+    s->handProfile = XR_NULL_PATH;
+    for (int k = 0; k < nsugg; k++) sugg[k].action->nb = 0;
     for (int k = 0; k < nsugg; k++) {
         Action *a = sugg[k].action;
-        if (sugg[k].profile != s->profile || a->nb >= 16) continue;
-        if (parse_binding(pstr(sugg[k].binding), &a->b[a->nb])) a->nb++;
+        int hp = sugg[k].profile == hand;
+        if ((sugg[k].profile != s->profile && !hp) || a->nb >= 32) continue;
+        if (parse_binding(pstr(sugg[k].binding), &a->b[a->nb])) { a->b[a->nb++].hp = hp; if (hp) s->handProfile = hand; }
     }
-    logmsg("attached %d bindings, profile %s", nsugg, pstr(s->profile));
-    if (evTail - evHead >= 64) evHead = evTail - 63;
-    XrEventDataInteractionProfileChanged *e = (XrEventDataInteractionProfileChanged *)&events[evTail++ % 64];
-    memset(e, 0, sizeof(XrEventDataBuffer));
-    e->type = XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED; e->session = h;
+    s->handMode[0] = s->handMode[1] = 0;
+    logmsg("attached %d bindings, profile %s%s", nsugg, pstr(s->profile), s->handProfile ? " + hand interaction" : "");
+    push_profile_changed(s);
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrGetCurrentInteractionProfile_(XrSession h, XrPath user, XrInteractionProfileState *st) {
     Session *s = (Session *)h;
     const char *u = pstr(user);
-    st->interactionProfile = !strcmp(u, "/user/hand/left") || !strcmp(u, "/user/hand/right") ? s->profile : XR_NULL_PATH;
+    int hand = !strcmp(u, "/user/hand/left") ? 0 : !strcmp(u, "/user/hand/right") ? 1 : -1;
+    st->interactionProfile = hand < 0 ? XR_NULL_PATH : s->handMode[hand] ? s->handProfile : s->profile;
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrSyncActions_(XrSession h, const XrActionsSyncInfo *si) {
     (void)si; Session *s = (Session *)h;
     read_tracking();
     syncGen++;
+    int changedMode = 0;   // a hand put its controller down (or picked it up): switch its profile
+    for (int k = 0; k < 2; k++) {
+        int m = s->handProfile && joints[k].tracked;
+        if (m != s->handMode[k]) { s->handMode[k] = m; changedMode = 1; }
+    }
+    if (changedMode) push_profile_changed(s);
     return s->focused ? XR_SUCCESS : XR_SESSION_NOT_FOCUSED;
 }
 static int active(Session *s) { return s->focused && !shm->input_blocked; }
@@ -1002,16 +1301,17 @@ static float action_value(Session *s, Action *a, XrPath sub, XrVector2f *v2, int
     if (v2) *v2 = (XrVector2f){0, 0};
     for (int i = 0; i < a->nb; i++) {
         Binding *b = &a->b[i];
-        if (!sub_matches(sub, b->hand)) continue;
+        if (!sub_matches(sub, b->hand) || !live(s, b)) continue;
         *bound = 1;
         if (!active(s)) continue;
         const VR4Hand *hh = &track.hand[b->hand];
         if (v2 && (!strcmp(b->comp, "thumbstick") || !strcmp(b->comp, "trackpad") || !strcmp(b->comp, "joystick") ||
                    !strcmp(b->comp, "thumbstick/2d") || !strcmp(b->comp, "trackpad/2d") || !strcmp(b->comp, "joystick/2d"))) {
+            if (!strncmp(b->comp, "trackpad", 8) && s->kind != K_VIVE) continue;
             if (fabsf(hh->stick_x) + fabsf(hh->stick_y) > fabsf(v2->x) + fabsf(v2->y)) *v2 = (XrVector2f){hh->stick_x, hh->stick_y};
             continue;
         }
-        float v = comp_value(hh, b->comp);
+        float v = b->hp ? hand_value(b->hand, b->comp) : comp_value(hh, b->hand, b->comp, s->kind);
         if (fabsf(v) > fabsf(best)) best = v;
     }
     return best;
@@ -1042,19 +1342,22 @@ static XrResult XRAPI_CALL xrGetActionStateVector2f_(XrSession h, const XrAction
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrGetActionStatePose_(XrSession h, const XrActionStateGetInfo *gi, XrActionStatePose *st) {
-    (void)h; Action *a = (Action *)gi->action;
+    Session *s = (Session *)h; Action *a = (Action *)gi->action;
     st->isActive = XR_FALSE;
-    for (int i = 0; i < a->nb; i++)
-        if (is_pose_comp(a->b[i].comp) && sub_matches(gi->subactionPath, a->b[i].hand)) {
-            if (track.hand[a->b[i].hand].flags & VR4_HAND_ACTIVE) st->isActive = XR_TRUE;
-        }
+    for (int i = 0; i < a->nb; i++) {
+        Binding *b = &a->b[i];
+        if (!is_pose_comp(b->comp) || !live(s, b) || !sub_matches(gi->subactionPath, b->hand)) continue;
+        if (b->hp ? joints[b->hand].tracked != 0 : (track.hand[b->hand].flags & VR4_HAND_ACTIVE) != 0) st->isActive = XR_TRUE;
+    }
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrEnumerateBoundSourcesForAction_(XrSession h, const XrBoundSourcesForActionEnumerateInfo *ei, uint32_t cap, uint32_t *n, XrPath *out) {
-    (void)h; Action *a = (Action *)ei->action;
+    Session *s = (Session *)h; Action *a = (Action *)ei->action;
+    Binding *b[32]; uint32_t nb = 0;
+    for (int i = 0; i < a->nb; i++) if (live(s, &a->b[i])) b[nb++] = &a->b[i];
     char buf[160];
-    FILL_ARRAY(cap, n, out, (uint32_t)a->nb, {
-        snprintf(buf, sizeof buf, "/user/hand/%s/input/%s", a->b[i_].hand ? "right" : "left", a->b[i_].comp);
+    FILL_ARRAY(cap, n, out, nb, {
+        snprintf(buf, sizeof buf, "/user/hand/%s/input/%s", b[i_]->hand ? "right" : "left", b[i_]->comp);
         out[i_] = intern(buf); });
     return XR_SUCCESS;
 }
@@ -1066,24 +1369,101 @@ static XrResult XRAPI_CALL xrGetInputSourceLocalizedName_(XrSession h, const XrI
     if (cap < len) return XR_ERROR_SIZE_INSUFFICIENT;
     memcpy(buf, s, len); return XR_SUCCESS;
 }
+/// Hands (bit 0 left, bit 1 right) an output action drives for this subaction path.
+static int haptic_hands(const XrHapticActionInfo *hi) {
+    Action *a = (Action *)hi->action; int m = 0;
+    for (int i = 0; i < a->nb; i++) if (sub_matches(hi->subactionPath, a->b[i].hand)) m |= 1 << a->b[i].hand;
+    return m;
+}
+/// Plain vibrations, plus XR_FB_haptic_pcm (a sample buffer: its peak for its length) and XR_FB_haptic_amplitude_envelope
+/// (its peak for its duration): MacVR plays one amplitude/duration/frequency pulse per hand.
 static XrResult XRAPI_CALL xrApplyHapticFeedback_(XrSession h, const XrHapticActionInfo *hi, const XrHapticBaseHeader *hb) {
     (void)h;
-    if (hb->type != XR_TYPE_HAPTIC_VIBRATION) return XR_SUCCESS;
-    const XrHapticVibration *v = (const XrHapticVibration *)hb;
-    Action *a = (Action *)hi->action;
-    for (int i = 0; i < a->nb; i++) if (sub_matches(hi->subactionPath, a->b[i].hand)) {
-        float dur = v->duration <= 0 ? 0.02f : (float)v->duration / 1e9f;
-        shm->haptic = (VR4Haptics){(uint8_t)a->b[i].hand, v->amplitude, dur, v->frequency > 0 ? v->frequency : 0};
-        vr4_fence(); shm->haptic_seq++;
-    }
+    float amp = 0, dur = 0, freq = 0;
+    if (hb->type == XR_TYPE_HAPTIC_VIBRATION) {
+        const XrHapticVibration *v = (const XrHapticVibration *)hb;
+        amp = v->amplitude; dur = v->duration <= 0 ? 0.02f : (float)v->duration / 1e9f; freq = v->frequency;
+    } else if (hb->type == XR_TYPE_HAPTIC_PCM_VIBRATION_FB) {
+        const XrHapticPcmVibrationFB *p = (const XrHapticPcmVibrationFB *)hb;
+        for (uint32_t i = 0; i < p->bufferSize; i++) amp = fmaxf(amp, fabsf(p->buffer[i]));
+        dur = p->sampleRate > 0 ? p->bufferSize / p->sampleRate : 0;
+        if (p->samplesConsumed) *p->samplesConsumed = p->bufferSize;
+    } else if (hb->type == XR_TYPE_HAPTIC_AMPLITUDE_ENVELOPE_VIBRATION_FB) {
+        const XrHapticAmplitudeEnvelopeVibrationFB *e = (const XrHapticAmplitudeEnvelopeVibrationFB *)hb;
+        for (uint32_t i = 0; i < e->amplitudeCount; i++) amp = fmaxf(amp, e->amplitudes[i]);
+        dur = (float)e->duration / 1e9f;
+    } else return XR_SUCCESS;
+    int m = haptic_hands(hi);
+    for (int k = 0; k < 2; k++) if (m >> k & 1) sxr_haptic(shm, k, amp, dur, freq, 0);
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrStopHapticFeedback_(XrSession h, const XrHapticActionInfo *hi) {
     (void)h;
-    Action *a = (Action *)hi->action;
-    for (int i = 0; i < a->nb; i++) if (sub_matches(hi->subactionPath, a->b[i].hand)) {
-        shm->haptic = (VR4Haptics){(uint8_t)a->b[i].hand, 0.0f, 0.0f, 0.0f};
-        vr4_fence(); shm->haptic_seq++;
+    int m = haptic_hands(hi);
+    for (int k = 0; k < 2; k++) if (m >> k & 1) sxr_haptic(shm, k, 0, 0, 0, 0);
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrGetDeviceSampleRateFB_(XrSession h, const XrHapticActionInfo *hi, XrDevicePcmSampleRateGetInfoFB *r) {
+    (void)h; (void)hi; r->sampleRate = 2000; return XR_SUCCESS;   // Touch PCM haptics rate
+}
+
+// ---------------------------------------------------------------- hand tracking (XR_EXT_hand_tracking, XR_FB_hand_tracking_aim)
+typedef struct { int hand; } HandTracker;
+static XrResult XRAPI_CALL xrCreateHandTrackerEXT_(XrSession h, const XrHandTrackerCreateInfoEXT *ci, XrHandTrackerEXT *out) {
+    (void)h;
+    if ((ci->hand != XR_HAND_LEFT_EXT && ci->hand != XR_HAND_RIGHT_EXT) || ci->handJointSet != XR_HAND_JOINT_SET_DEFAULT_EXT)
+        return XR_ERROR_VALIDATION_FAILURE;
+    HandTracker *t = calloc(1, sizeof *t); t->hand = ci->hand == XR_HAND_RIGHT_EXT;
+    *out = (XrHandTrackerEXT)t; return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrDestroyHandTrackerEXT_(XrHandTrackerEXT t) { free(t); return XR_SUCCESS; }
+/// Joints from MacVR while the hand is tracked (controller put down), relative to the base space. Radii are typical
+/// adult values; velocities are not reported (velocityFlags 0).
+static XrResult XRAPI_CALL xrLocateHandJointsEXT_(XrHandTrackerEXT ht, const XrHandJointsLocateInfoEXT *li, XrHandJointLocationsEXT *loc) {
+    static const float radius[XR_HAND_JOINT_COUNT_EXT] = {0.025f, 0.02f, 0.015f, 0.012f, 0.01f, 0.009f,   // palm, wrist, thumb
+                                                          0.012f, 0.01f, 0.009f, 0.008f, 0.007f, 0.012f, 0.01f, 0.009f, 0.008f, 0.007f,
+                                                          0.012f, 0.009f, 0.008f, 0.0075f, 0.0065f, 0.011f, 0.008f, 0.007f, 0.0065f, 0.006f};
+    if (loc->jointCount != XR_HAND_JOINT_COUNT_EXT) return XR_ERROR_VALIDATION_FAILURE;
+    int h = ((HandTracker *)ht)->hand, valid;
+    XrPosef base = space_in_stage((Space *)li->baseSpace, &valid), inv = pinv(base);
+    const VR4HandJoints *j = &joints[h];
+    int on = j->tracked && valid && !shm->input_blocked;   // no hand input while MacVR's menu is open
+    float ws = current_world_scale();
+    loc->isActive = on;
+    for (uint32_t i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++) {
+        XrHandJointLocationEXT *l = &loc->jointLocations[i];
+        l->locationFlags = on ? XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT : 0;
+        l->pose = on ? pmul(inv, xp(j->joint[i])) : IDENT;
+        l->radius = radius[i] / ws;
+    }
+    for (XrBaseOutStructure *n = (XrBaseOutStructure *)loc->next; n; n = n->next) {
+        if (n->type == XR_TYPE_HAND_JOINT_VELOCITIES_EXT) {
+            XrHandJointVelocitiesEXT *v = (XrHandJointVelocitiesEXT *)n;
+            for (uint32_t i = 0; i < v->jointCount; i++) v->jointVelocities[i] = (XrHandJointVelocityEXT){0};
+        } else if (n->type == XR_TYPE_HAND_TRACKING_AIM_STATE_FB) {
+            XrHandTrackingAimStateFB *a = (XrHandTrackingAimStateFB *)n;
+            const VR4Hand *vh = &track.hand[h];
+            a->status = 0; a->aimPose = IDENT;
+            a->pinchStrengthIndex = a->pinchStrengthMiddle = a->pinchStrengthRing = a->pinchStrengthLittle = 0;
+            if (!on) continue;
+            a->aimPose = pmul(inv, xp(vh->aim));
+            a->pinchStrengthIndex = fmaxf(vh->trigger, sxr_pinch(j, 1));
+            a->pinchStrengthMiddle = sxr_pinch(j, 2); a->pinchStrengthRing = sxr_pinch(j, 3); a->pinchStrengthLittle = sxr_pinch(j, 4);
+            a->status = XR_HAND_TRACKING_AIM_COMPUTED_BIT_FB | XR_HAND_TRACKING_AIM_VALID_BIT_FB;
+            if (a->pinchStrengthIndex > 0.9f) a->status |= XR_HAND_TRACKING_AIM_INDEX_PINCHING_BIT_FB;
+            if (a->pinchStrengthMiddle > 0.9f) a->status |= XR_HAND_TRACKING_AIM_MIDDLE_PINCHING_BIT_FB;
+            if (a->pinchStrengthRing > 0.9f) a->status |= XR_HAND_TRACKING_AIM_RING_PINCHING_BIT_FB;
+            if (a->pinchStrengthLittle > 0.9f) a->status |= XR_HAND_TRACKING_AIM_LITTLE_PINCHING_BIT_FB;
+            if (h) a->status |= XR_HAND_TRACKING_AIM_DOMINANT_HAND_BIT_FB;
+            if (!h && (vh->buttons & VR4_BTN_MENU)) a->status |= XR_HAND_TRACKING_AIM_MENU_PRESSED_BIT_FB;
+            // system gesture: the palm (its -Y) faces the headset
+            VR4Pose pp = j->joint[XR_HAND_JOINT_PALM_EXT];
+            V palmN = qrot((Q){pp.qx, pp.qy, pp.qz, pp.qw}, (V){0, -1, 0});
+            V toHead = {track.head.px - pp.px, track.head.py - pp.py, track.head.pz - pp.pz};
+            float d = sqrtf(toHead.x * toHead.x + toHead.y * toHead.y + toHead.z * toHead.z);
+            if (d > 1e-4f && (palmN.x * toHead.x + palmN.y * toHead.y + palmN.z * toHead.z) / d > 0.7f) a->status |= XR_HAND_TRACKING_AIM_SYSTEM_GESTURE_BIT_FB;
+        }
     }
     return XR_SUCCESS;
 }
@@ -1097,9 +1477,98 @@ static XrResult XRAPI_CALL xrGetDisplayRefreshRateFB_(XrSession h, float *rate) 
 static XrResult XRAPI_CALL xrRequestDisplayRefreshRateFB_(XrSession h, float rate) {
     (void)h; return rate == 0 || fabsf(rate - current_hz()) < 0.5f ? XR_SUCCESS : XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB;
 }
+/// The lens mask (siliconxr_shared.h) in the view's tangent space (the z = -1 plane) for the eye's current field of view.
 static XrResult XRAPI_CALL xrGetVisibilityMaskKHR_(XrSession h, XrViewConfigurationType t, uint32_t view, XrVisibilityMaskTypeKHR mt, XrVisibilityMaskKHR *m) {
-    (void)h; (void)t; (void)view; (void)mt;   // no hidden-area mask: the whole eye buffer is visible
-    m->vertexCountOutput = 0; m->indexCountOutput = 0; return XR_SUCCESS;
+    (void)h;
+    if (t != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    if (view > 1) return XR_ERROR_VALIDATION_FAILURE;
+    float tri[2 * SXR_MASK_N][3][2], ring[SXR_MASK_N][2], rect[SXR_MASK_N][2];
+    const float *pts; uint32_t n;
+    if (mt == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) { sxr_mask_ring(ring, rect); pts = &ring[0][0]; n = SXR_MASK_N; }
+    else if (mt == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR || mt == XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR) {
+        n = 3 * (uint32_t)sxr_mask_triangles(mt == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, tri); pts = &tri[0][0][0];
+    } else return XR_ERROR_VALIDATION_FAILURE;
+    m->vertexCountOutput = m->indexCountOutput = n;
+    if (!m->vertexCapacityInput || !m->indexCapacityInput) return XR_SUCCESS;
+    if (m->vertexCapacityInput < n || m->indexCapacityInput < n) return XR_ERROR_SIZE_INSUFFICIENT;
+    VR4Fov f = frame_eye(&frameTrack, (int)view).fov;
+    float L = tanf(f.left), R = tanf(f.right), U = tanf(f.up), D = tanf(f.down);
+    for (uint32_t i = 0; i < n; i++) {
+        m->vertices[i] = (XrVector2f){L + (pts[2 * i] + 1) / 2 * (R - L), D + (pts[2 * i + 1] + 1) / 2 * (U - D)};
+        m->indices[i] = i;
+    }
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrLocateSpacesKHR_(XrSession h, const XrSpacesLocateInfoKHR *li, XrSpaceLocationsKHR *out) {
+    (void)h;
+    if (out->locationCount != li->spaceCount) return XR_ERROR_VALIDATION_FAILURE;
+    XrSpaceVelocitiesKHR *vel = NULL;
+    for (XrBaseOutStructure *n = (XrBaseOutStructure *)out->next; n; n = n->next)
+        if (n->type == XR_TYPE_SPACE_VELOCITIES_KHR) vel = (XrSpaceVelocitiesKHR *)n;
+    for (uint32_t i = 0; i < li->spaceCount; i++) {
+        XrSpaceVelocity v = {XR_TYPE_SPACE_VELOCITY};
+        XrSpaceLocation l = {XR_TYPE_SPACE_LOCATION, vel ? &v : NULL};
+        xrLocateSpace_(li->spaces[i], li->baseSpace, li->time, &l);
+        out->locations[i] = (XrSpaceLocationDataKHR){l.locationFlags, l.pose};
+        if (vel && i < vel->velocityCount) vel->velocities[i] = (XrSpaceVelocityDataKHR){v.velocityFlags, v.linearVelocity, v.angularVelocity};
+    }
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrPerfSettingsSetPerformanceLevelEXT_(XrSession h, XrPerfSettingsDomainEXT d, XrPerfSettingsLevelEXT l) {
+    (void)h; (void)d; (void)l; return XR_SUCCESS;   // a hint: the Mac runs the game as fast as it can
+}
+
+// XR_META_performance_metrics: the game's frame time and frames dropped before streaming.
+static const char *perfPaths[] = {"/perfmetrics_meta/app/cpu_frametime", "/perfmetrics_meta/compositor/dropped_frame_count"};
+static XrResult XRAPI_CALL xrEnumeratePerformanceMetricsCounterPathsMETA_(XrInstance i, uint32_t cap, uint32_t *n, XrPath *p) {
+    (void)i; FILL_ARRAY(cap, n, p, 2, p[i_] = intern(perfPaths[i_])); return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrSetPerformanceMetricsStateMETA_(XrSession h, const XrPerformanceMetricsStateMETA *st) {
+    ((Session *)h)->perfMetrics = st->enabled != 0; return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrGetPerformanceMetricsStateMETA_(XrSession h, XrPerformanceMetricsStateMETA *st) {
+    st->enabled = ((Session *)h)->perfMetrics; return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrQueryPerformanceMetricsCounterMETA_(XrSession h, XrPath path, XrPerformanceMetricsCounterMETA *c) {
+    const char *p = pstr(path);
+    c->counterFlags = 0; c->uintValue = 0; c->floatValue = 0;
+    if (!strcmp(p, perfPaths[0])) {
+        c->counterUnit = XR_PERFORMANCE_METRICS_COUNTER_UNIT_MILLISECONDS_META; c->floatValue = gameMs;
+        if (((Session *)h)->perfMetrics) c->counterFlags = XR_PERFORMANCE_METRICS_COUNTER_ANY_VALUE_VALID_BIT_META | XR_PERFORMANCE_METRICS_COUNTER_FLOAT_VALUE_VALID_BIT_META;
+    } else if (!strcmp(p, perfPaths[1])) {
+        c->counterUnit = XR_PERFORMANCE_METRICS_COUNTER_UNIT_GENERIC_META; c->uintValue = droppedFrames;
+        if (((Session *)h)->perfMetrics) c->counterFlags = XR_PERFORMANCE_METRICS_COUNTER_ANY_VALUE_VALID_BIT_META | XR_PERFORMANCE_METRICS_COUNTER_UINT_VALUE_VALID_BIT_META;
+    } else return XR_ERROR_PATH_UNSUPPORTED;
+    return XR_SUCCESS;
+}
+
+// XR_FB_foveation (+ configuration, swapchain update state): foveation is a rendering hint we cannot apply to the
+// stream; profiles are kept so apps read back what they set.
+typedef struct { XrFoveationLevelFB level; float verticalOffset; XrFoveationDynamicFB dynamic; } FoveationProfile;
+static XrResult XRAPI_CALL xrCreateFoveationProfileFB_(XrSession h, const XrFoveationProfileCreateInfoFB *ci, XrFoveationProfileFB *out) {
+    (void)h;
+    FoveationProfile *f = calloc(1, sizeof *f);
+    for (const XrBaseInStructure *n = ci->next; n; n = n->next)
+        if (n->type == XR_TYPE_FOVEATION_LEVEL_PROFILE_CREATE_INFO_FB) {
+            const XrFoveationLevelProfileCreateInfoFB *l = (const XrFoveationLevelProfileCreateInfoFB *)n;
+            f->level = l->level; f->verticalOffset = l->verticalOffset; f->dynamic = l->dynamic;
+        }
+    *out = (XrFoveationProfileFB)f; return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrDestroyFoveationProfileFB_(XrFoveationProfileFB p) { free(p); return XR_SUCCESS; }
+static XrResult XRAPI_CALL xrUpdateSwapchainFB_(XrSwapchain h, const XrSwapchainStateBaseHeaderFB *st) {
+    Swapchain *sc = find_sc(h);
+    if (st->type != XR_TYPE_SWAPCHAIN_STATE_FOVEATION_FB) return XR_ERROR_VALIDATION_FAILURE;
+    const XrSwapchainStateFoveationFB *f = (const XrSwapchainStateFoveationFB *)st;
+    sc->fovFlags = f->flags; sc->fovProfile = f->profile;
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrGetSwapchainStateFB_(XrSwapchain h, XrSwapchainStateBaseHeaderFB *st) {
+    Swapchain *sc = find_sc(h);
+    if (st->type != XR_TYPE_SWAPCHAIN_STATE_FOVEATION_FB) return XR_ERROR_VALIDATION_FAILURE;
+    XrSwapchainStateFoveationFB *f = (XrSwapchainStateFoveationFB *)st;
+    f->flags = sc->fovFlags; f->profile = sc->fovProfile;
+    return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrEnumerateColorSpacesFB_(XrSession h, uint32_t cap, uint32_t *n, XrColorSpaceFB *cs) {
     (void)h;
@@ -1144,6 +1613,10 @@ static const struct { const char *name; PFN_xrVoidFunction fn; } table[] = {
     F(xrEnumerateColorSpacesFB) F(xrSetColorSpaceFB)
     F(xrSetDebugUtilsObjectNameEXT) F(xrCreateDebugUtilsMessengerEXT) F(xrDestroyDebugUtilsMessengerEXT)
     F(xrSessionBeginDebugUtilsLabelRegionEXT) F(xrSessionEndDebugUtilsLabelRegionEXT) F(xrSessionInsertDebugUtilsLabelEXT)
+    F(xrCreateHandTrackerEXT) F(xrDestroyHandTrackerEXT) F(xrLocateHandJointsEXT) F(xrLocateSpacesKHR) F(xrGetDeviceSampleRateFB)
+    F(xrPerfSettingsSetPerformanceLevelEXT) F(xrEnumeratePerformanceMetricsCounterPathsMETA) F(xrSetPerformanceMetricsStateMETA)
+    F(xrGetPerformanceMetricsStateMETA) F(xrQueryPerformanceMetricsCounterMETA) F(xrCreateFoveationProfileFB) F(xrDestroyFoveationProfileFB)
+    F(xrUpdateSwapchainFB) F(xrGetSwapchainStateFB)
 #undef F
 };
 static XrResult XRAPI_CALL xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xrVoidFunction *fn) {

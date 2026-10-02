@@ -14,16 +14,19 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include "openvr_capi.h"
-#include "../common/vr4mac.h"
+#include <OpenGL/OpenGL.h>
+#include "siliconxr_shared.h"
 
 #define EXPORT __attribute__((visibility("default")))
 
 _Static_assert(sizeof(InputDigitalActionData_t) == 24 && sizeof(InputAnalogActionData_t) == 48, "LWJGL layout");
 _Static_assert(sizeof(InputPoseActionData_t) == 96 && sizeof(TrackedDevicePose_t) == 80, "LWJGL layout");
 _Static_assert(sizeof(InputOriginInfo_t) == 144 && sizeof(VRActiveActionSet_t) == 32, "LWJGL layout");
+_Static_assert(sizeof(InputSkeletalActionData_t) == 16 && sizeof(VRBoneTransform_t) == 32 && sizeof(VRSkeletalSummaryData_t) == 36, "LWJGL layout");
 
 static VR4Shm *shm;
 static VR4Tracking track;              // latest snapshot (WaitGetPoses / UpdateActionState)
+static VR4HandJoints joints[2];        // hand-tracking joints of the same snapshot
 static uint32_t lastSeq;
 static ETrackingUniverseOrigin trackingSpace = ETrackingUniverseOrigin_TrackingUniverseStanding;
 
@@ -37,14 +40,7 @@ static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 static float fps(void) { return shm && shm->fps > 0 ? shm->fps : 72; }
 static float world_scale(void) { return shm && shm->world_scale > 0.01f ? shm->world_scale : 1; }
 
-static void read_tracking(void) {      // seqlock read of the Mac app's latest sample
-    for (int tries = 0; shm && tries < 100; tries++) {
-        uint32_t s1 = shm->track_seq; vr4_fence();
-        if (s1 & 1) continue;
-        VR4Tracking t = shm->track; vr4_fence();
-        if (shm->track_seq == s1) { track = t; lastSeq = s1; return; }
-    }
-}
+static void read_tracking(void) { sxr_read(shm, &track, joints, &lastSeq); }   // seqlock read of the Mac app's latest sample
 
 // ---------------------------------------------------------------- math
 static HmdMatrix34_t mat(VR4Pose p) {
@@ -203,6 +199,10 @@ static void load_bindings(NSString *file) {
             int a = add_action([p[@"output"] UTF8String], "vibration");
             if (a >= 0) actions[a].hand = hand_of(p[@"path"]);
         }
+        for (NSDictionary *p in s[@"skeleton"]) {   // {"output": ..., "path": "/user/hand/left/input/skeleton/left"}
+            int a = add_action([p[@"output"] UTF8String], "skeleton");
+            if (a >= 0) actions[a].hand = hand_of(p[@"path"]);
+        }
         for (NSDictionary *src in s[@"sources"]) {
             NSString *path = src[@"path"], *mode = src[@"mode"];
             NSDictionary *inputs = src[@"inputs"];
@@ -240,6 +240,7 @@ static EVRInputError SetActionManifestPath(char *path) {
         for (NSDictionary *a in m[@"actions"]) {
             int i = add_action([a[@"name"] UTF8String], [a[@"type"] UTF8String]);
             if (i >= 0) snprintf(actions[i].type, 16, "%s", [a[@"type"] UTF8String]);
+            if (i >= 0 && [a[@"skeleton"] isKindOfClass:NSString.class]) actions[i].hand = [a[@"skeleton"] hasSuffix:@"right"] ? 1 : 0;   // "/skeleton/hand/left"
         }
         NSString *file = nil;
         for (NSDictionary *d in m[@"default_bindings"])
@@ -399,6 +400,9 @@ static EVRInputError GetPoseActionDataForNextFrame(VRActionHandle_t h, ETracking
     }
     return EVRInputError_VRInputError_None;
 }
+static EVRInputError GetPoseActionDataRelativeToNow(VRActionHandle_t h, ETrackingUniverseOrigin o, float t, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t r) {
+    (void)t; return GetPoseActionDataForNextFrame(h, o, d, size, r);   // poses are already predicted to the display time
+}
 static EVRInputError GetOriginTrackedDeviceInfo(VRInputValueHandle_t origin, InputOriginInfo_t *info, uint32_t size) {
     memset(info, 0, size);
     if (origin != 1 && origin != 2) return EVRInputError_VRInputError_InvalidHandle;
@@ -418,14 +422,215 @@ static EVRInputError GetOriginLocalizedName(VRInputValueHandle_t origin, char *n
     return EVRInputError_VRInputError_None;
 }
 static EVRInputError TriggerHapticVibrationAction(VRActionHandle_t h, float start, float dur, float freq, float amp, VRInputValueHandle_t r) {
-    (void)start;
     Action *a = action(h);
     if (!a) return EVRInputError_VRInputError_InvalidHandle;
     int hand = a->hand >= 0 ? a->hand : r == 1 ? 0 : r == 2 ? 1 : -1;
-    if (hand < 0 || !shm) return EVRInputError_VRInputError_None;
-    shm->haptic = (VR4Haptics){(uint8_t)hand, amp, dur > 0 ? dur : 0.02f, freq > 0 ? freq : 0};
-    vr4_fence(); shm->haptic_seq++;
+    sxr_haptic(shm, hand, amp, dur > 0 ? dur : 0.02f, freq, start);   // start: seconds from now
     return EVRInputError_VRInputError_None;
+}
+
+// ---------------------------------------------------------------- skeletal input (SteamVR's 31-bone hand)
+// Bones come from MacVR's hand-tracking joints while a hand is tracked, else from a hand posed by the controller's
+// trigger, grip and touch sensors. A SteamVR bone frame is the OpenXR joint frame times a constant basis change
+// (+X along the finger on the left hand, -X on the right; the wrist adds a twist), the same mapping ALVR uses.
+// Root = the hand's pose action (the grip), as SteamVR's root sits on the controller pose.
+typedef struct { float x, y, z; } V3;
+typedef struct { Quat q; V3 p; } Xf;
+static V3 q_rot(Quat q, V3 v) { Quat r = q_mul(q_mul(q, (Quat){v.x, v.y, v.z, 0}), q_conj(q)); return (V3){r.x, r.y, r.z}; }
+static Xf xf_mul(Xf a, Xf b) { V3 t = q_rot(a.q, b.p); return (Xf){q_mul(a.q, b.q), {a.p.x + t.x, a.p.y + t.y, a.p.z + t.z}}; }
+static Xf xf_inv(Xf a) { Quat c = q_conj(a.q); V3 t = q_rot(c, a.p); return (Xf){c, {-t.x, -t.y, -t.z}}; }
+static Xf xf_of(VR4Pose p) { return (Xf){{p.qx, p.qy, p.qz, p.qx || p.qy || p.qz || p.qw ? p.qw : 1}, {p.px, p.py, p.pz}}; }
+static Quat q_axis(float ax, float ay, float az, float angle) { float s = sinf(angle / 2); return (Quat){ax * s, ay * s, az * s, cosf(angle / 2)}; }
+/// Rotation whose -Z points along `dir` and whose +Y is as close to `up` as possible.
+static Quat q_look(V3 dir, V3 up) {
+    float l = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    V3 z = {-dir.x / l, -dir.y / l, -dir.z / l};
+    V3 x = {up.y * z.z - up.z * z.y, up.z * z.x - up.x * z.z, up.x * z.y - up.y * z.x};
+    l = sqrtf(x.x * x.x + x.y * x.y + x.z * x.z); x = (V3){x.x / l, x.y / l, x.z / l};
+    V3 y = {z.y * x.z - z.z * x.y, z.z * x.x - z.x * x.z, z.x * x.y - z.y * x.x};
+    float t = x.x + y.y + z.z, s;
+    if (t > 0) { s = sqrtf(t + 1) * 2; return (Quat){(y.z - z.y) / s, (z.x - x.z) / s, (x.y - y.x) / s, s / 4}; }
+    if (x.x > y.y && x.x > z.z) { s = sqrtf(1 + x.x - y.y - z.z) * 2; return (Quat){s / 4, (y.x + x.y) / s, (z.x + x.z) / s, (y.z - z.y) / s}; }
+    if (y.y > z.z) { s = sqrtf(1 + y.y - x.x - z.z) * 2; return (Quat){(y.x + x.y) / s, s / 4, (z.y + y.z) / s, (z.x - x.z) / s}; }
+    s = sqrtf(1 + z.z - x.x - y.y) * 2; return (Quat){(z.x + x.z) / s, (z.y + y.z) / s, s / 4, (x.y - y.x) / s};
+}
+enum { NBONES = 31 };
+static const BoneIndex_t boneParent[NBONES] = {-1, 0, 1, 2, 3, 4, 1, 6, 7, 8, 9, 1, 11, 12, 13, 14, 1, 16, 17, 18, 19, 1, 21, 22, 23, 24, 0, 0, 0, 0, 0};
+static const char *boneName[NBONES] = {"Root", "wrist_?", "finger_thumb_0_?", "finger_thumb_1_?", "finger_thumb_2_?", "finger_thumb_?_end",
+    "finger_index_meta_?", "finger_index_0_?", "finger_index_1_?", "finger_index_2_?", "finger_index_?_end",
+    "finger_middle_meta_?", "finger_middle_0_?", "finger_middle_1_?", "finger_middle_2_?", "finger_middle_?_end",
+    "finger_ring_meta_?", "finger_ring_0_?", "finger_ring_1_?", "finger_ring_2_?", "finger_ring_?_end",
+    "finger_pinky_meta_?", "finger_pinky_0_?", "finger_pinky_1_?", "finger_pinky_2_?", "finger_pinky_?_end",
+    "finger_thumb_?_aux", "finger_index_?_aux", "finger_middle_?_aux", "finger_ring_?_aux", "finger_pinky_?_aux"};
+
+/// A left hand (OpenXR joints, grip space) holding a controller, fingers curled by c[0..4] (0 open .. 1 fist).
+/// The right hand is its mirror image across the grip's YZ plane.
+static void synth_joints(const float c[5], int right, Xf j[26]) {
+    static const float base[5][3] = {{0.022f, -0.012f, 0.032f}, {0.010f, 0, 0.040f}, {0.002f, 0, 0.040f}, {-0.008f, 0, 0.038f}, {-0.016f, -0.002f, 0.034f}};
+    static const float knuckle[5][3] = {{0.040f, -0.020f, 0.002f}, {0.024f, 0.004f, -0.030f}, {0.004f, 0.006f, -0.034f}, {-0.016f, 0.004f, -0.030f}, {-0.034f, 0, -0.022f}};
+    static const float len[5][3] = {{0.032f, 0.028f, 0}, {0.040f, 0.024f, 0.022f}, {0.044f, 0.028f, 0.024f}, {0.040f, 0.026f, 0.023f}, {0.032f, 0.019f, 0.020f}};
+    static const float flex[5][3] = {{0.7f, 1.0f, 0}, {1.4f, 1.75f, 1.2f}, {1.4f, 1.75f, 1.2f}, {1.4f, 1.75f, 1.2f}, {1.4f, 1.75f, 1.2f}};
+    Xf pj[26];   // palm space: palm at the origin, fingers toward -Z, back of the hand +Y, thumb toward +X
+    pj[0] = (Xf){{0, 0, 0, 1}, {0, 0, 0}};
+    pj[1] = (Xf){{0, 0, 0, 1}, {0, 0, 0.05f}};
+    for (int f = 0; f < 5; f++) {
+        int m = sxr_meta(f), n = sxr_tip(f) - m;   // joints after the metacarpal: thumb 3, fingers 4
+        V3 b = {base[f][0], base[f][1], base[f][2]}, k = {knuckle[f][0], knuckle[f][1], knuckle[f][2]};
+        Quat o = q_look((V3){k.x - b.x, k.y - b.y, k.z - b.z}, (V3){0, 1, 0});
+        if (!f) o = q_mul(o, q_axis(0, 1, 0, 0.5f * c[0]));   // the thumb swings across the palm
+        pj[m] = (Xf){o, b};
+        V3 p = k;
+        for (int s = 0; s < n; s++) {
+            if (s < 3) o = q_mul(o, q_axis(1, 0, 0, -flex[f][s] * c[f]));   // curl toward the palm (-Y)
+            pj[m + 1 + s] = (Xf){o, p};
+            if (s < n - 1) { V3 d = q_rot(o, (V3){0, 0, -len[f][s]}); p = (V3){p.x + d.x, p.y + d.y, p.z + d.z}; }
+        }
+    }
+    // palm in grip space: facing +X (into the handle), fingers wrapping toward +X, back of the hand toward -X
+    static const Xf palm = {{-0.5f, 0.5f, 0.5f, 0.5f}, {-0.035f, 0.025f, 0}};
+    for (int i = 0; i < 26; i++) {
+        j[i] = xf_mul(palm, pj[i]);
+        if (right) { j[i].p.x = -j[i].p.x; j[i].q.y = -j[i].q.y; j[i].q.z = -j[i].q.z; }
+    }
+}
+/// Finger curls (thumb..little) a Touch controller's sensors imply.
+static void controller_curls(const VR4Hand *h, float c[5]) {
+    c[0] = h->buttons & (VR4_BTN_THUMB_TOUCH | VR4_BTN_STICK_TOUCH | VR4_BTN_A | VR4_BTN_B | VR4_BTN_X | VR4_BTN_Y | VR4_BTN_STICK_CLICK) ? 0.6f : 0.1f;
+    c[1] = h->buttons & VR4_BTN_TRIGGER_TOUCH ? 0.45f + 0.55f * h->trigger : 0.6f * h->trigger;   // lifted off the trigger: pointing
+    c[2] = c[3] = c[4] = 0.15f + 0.85f * h->squeeze;
+}
+/// Model-space bones of `hand` (31). Real joints while tracked, else the controller pose; `limit` caps curls at
+/// the controller's handle (VRSkeletalMotionRange_WithController).
+static void hand_bones(int hand, int limit, const float *curls, VRBoneTransform_t out[NBONES]) {
+    Xf j[26];
+    if (!curls && joints[hand].tracked) {
+        Xf root = xf_inv(xf_of(track.hand[hand].grip));
+        for (int i = 0; i < 26; i++) j[i] = xf_mul(root, xf_of(joints[hand].joint[i]));
+    } else {
+        float c[5];
+        if (curls) memcpy(c, curls, sizeof c); else controller_curls(&track.hand[hand], c);
+        for (int f = 0; f < 5 && limit; f++) c[f] = fminf(c[f], 0.75f);
+        synth_joints(c, hand, j);
+    }
+    static const Quat K[2] = {{0.70710678f, 0, -0.70710678f, 0}, {0, -0.70710678f, 0, 0.70710678f}}, F = {0.5f, -0.5f, 0.5f, 0.5f};
+    float ws = world_scale();
+    for (int b = 0; b < NBONES; b++) {
+        Xf m = b == 0 ? (Xf){{0, 0, 0, 1}, {0, 0, 0}} : j[b < 26 ? b : sxr_tip(b - 26) - 1];   // aux bones = the distal joints
+        if (b) m.q = q_mul(m.q, b == 1 ? q_mul(F, K[hand]) : K[hand]);
+        out[b] = (VRBoneTransform_t){{{m.p.x / ws, m.p.y / ws, m.p.z / ws, 1}}, {m.q.w, m.q.x, m.q.y, m.q.z}};
+    }
+}
+static Xf bone_xf(VRBoneTransform_t b) { return (Xf){{b.orientation.x, b.orientation.y, b.orientation.z, b.orientation.w}, {b.position.v[0], b.position.v[1], b.position.v[2]}}; }
+static void to_parent_space(VRBoneTransform_t t[NBONES]) {
+    VRBoneTransform_t m[NBONES]; memcpy(m, t, sizeof m);
+    for (int b = 1; b < NBONES; b++) {
+        Xf l = xf_mul(xf_inv(bone_xf(m[boneParent[b]])), bone_xf(m[b]));
+        t[b] = (VRBoneTransform_t){{{l.p.x, l.p.y, l.p.z, 1}}, {l.q.w, l.q.x, l.q.y, l.q.z}};
+    }
+}
+static void to_model_space(VRBoneTransform_t t[NBONES]) {   // parents come first
+    for (int b = 1; b < NBONES; b++) {
+        Xf m = xf_mul(bone_xf(t[boneParent[b]]), bone_xf(t[b]));
+        t[b] = (VRBoneTransform_t){{{m.p.x, m.p.y, m.p.z, 1}}, {m.q.w, m.q.x, m.q.y, m.q.z}};
+    }
+}
+static Action *skeleton(VRActionHandle_t h, EVRInputError *err) {
+    Action *a = action(h);
+    *err = !a ? EVRInputError_VRInputError_InvalidHandle : strcmp(a->type, "skeleton") || a->hand < 0 ? EVRInputError_VRInputError_WrongType : 0;
+    return *err ? NULL : a;
+}
+static EVRInputError GetSkeletalActionData(VRActionHandle_t h, InputSkeletalActionData_t *d, uint32_t size) {
+    EVRInputError err; Action *a = skeleton(h, &err);
+    if (!a) return err;
+    memset(d, 0, size);
+    d->bActive = joints[a->hand].tracked || (track.hand[a->hand].flags & VR4_HAND_ACTIVE);
+    d->activeOrigin = (VRInputValueHandle_t)a->hand + 1;
+    return 0;
+}
+static ETrackedControllerRole dominantHand = ETrackedControllerRole_TrackedControllerRole_RightHand;
+static EVRInputError GetDominantHand(ETrackedControllerRole *r) { *r = dominantHand; return 0; }
+static EVRInputError SetDominantHand(ETrackedControllerRole r) { dominantHand = r; return 0; }
+static EVRInputError GetBoneCount(VRActionHandle_t h, uint32_t *n) {
+    EVRInputError err; if (!skeleton(h, &err)) return err;
+    *n = NBONES; return 0;
+}
+static EVRInputError GetBoneHierarchy(VRActionHandle_t h, BoneIndex_t *parents, uint32_t n) {
+    EVRInputError err; if (!skeleton(h, &err)) return err;
+    if (n != NBONES) return EVRInputError_VRInputError_InvalidBoneCount;
+    memcpy(parents, boneParent, sizeof boneParent); return 0;
+}
+static EVRInputError GetBoneName(VRActionHandle_t h, BoneIndex_t b, char *name, uint32_t size) {
+    EVRInputError err; Action *a = skeleton(h, &err);
+    if (!a) return err;
+    if (b < 0 || b >= NBONES) return EVRInputError_VRInputError_InvalidBoneIndex;
+    if (strlen(boneName[b]) + 1 > size) return EVRInputError_VRInputError_BufferTooSmall;
+    strcpy(name, boneName[b]);
+    char *q = strchr(name, '?'); if (q) *q = a->hand ? 'r' : 'l';
+    return 0;
+}
+static EVRInputError GetSkeletalReferenceTransforms(VRActionHandle_t h, EVRSkeletalTransformSpace space, EVRSkeletalReferencePose pose, VRBoneTransform_t *t, uint32_t n) {
+    EVRInputError err; Action *a = skeleton(h, &err);
+    if (!a) return err;
+    if (n != NBONES) return EVRInputError_VRInputError_InvalidBoneCount;
+    static const float open[5] = {0}, fist[5] = {1, 1, 1, 1, 1}, grip[5] = {0.6f, 0.75f, 0.75f, 0.75f, 0.75f};
+    hand_bones(a->hand, 0, pose == EVRSkeletalReferencePose_VRSkeletalReferencePose_Fist ? fist :
+                           pose == EVRSkeletalReferencePose_VRSkeletalReferencePose_GripLimit ? grip : open, t);
+    if (space == EVRSkeletalTransformSpace_VRSkeletalTransformSpace_Parent) to_parent_space(t);
+    return 0;
+}
+static EVRInputError GetSkeletalTrackingLevel(VRActionHandle_t h, EVRSkeletalTrackingLevel *l) {
+    EVRInputError err; Action *a = skeleton(h, &err);
+    if (!a) return err;
+    *l = joints[a->hand].tracked ? EVRSkeletalTrackingLevel_VRSkeletalTracking_Full : EVRSkeletalTrackingLevel_VRSkeletalTracking_Partial;   // Touch: capacitive fingers
+    return 0;
+}
+static EVRInputError GetSkeletalBoneData(VRActionHandle_t h, EVRSkeletalTransformSpace space, EVRSkeletalMotionRange range, VRBoneTransform_t *t, uint32_t n) {
+    EVRInputError err; Action *a = skeleton(h, &err);
+    if (!a) return err;
+    if (n != NBONES) return EVRInputError_VRInputError_InvalidBoneCount;
+    hand_bones(a->hand, range == EVRSkeletalMotionRange_VRSkeletalMotionRange_WithController, NULL, t);
+    if (space == EVRSkeletalTransformSpace_VRSkeletalTransformSpace_Parent) to_parent_space(t);
+    return 0;
+}
+static EVRInputError GetSkeletalSummaryData(VRActionHandle_t h, EVRSummaryType type, VRSkeletalSummaryData_t *d) {
+    (void)type;
+    EVRInputError err; Action *a = skeleton(h, &err);
+    if (!a) return err;
+    memset(d, 0, sizeof *d);
+    const VR4HandJoints *j = &joints[a->hand];
+    if (!j->tracked) { controller_curls(&track.hand[a->hand], d->flFingerCurl); return 0; }
+    V3 dir[5];   // proximal bone directions, for the splay between neighbouring fingers
+    for (int f = 0; f < 5; f++) {
+        d->flFingerCurl[f] = sxr_curl(j, f);
+        VR4Pose p = j->joint[sxr_meta(f) + 1], q = j->joint[sxr_meta(f) + 2];
+        float l = fmaxf(sxr_dist(p, q), 1e-5f);
+        dir[f] = (V3){(q.px - p.px) / l, (q.py - p.py) / l, (q.pz - p.pz) / l};
+    }
+    for (int f = 0; f < 4; f++) {
+        float c = dir[f].x * dir[f + 1].x + dir[f].y * dir[f + 1].y + dir[f].z * dir[f + 1].z;
+        d->flFingerSplay[f] = fminf(1, acosf(fmaxf(-1, fminf(1, c))) / (f ? 0.35f : 0.6f));   // full splay ~20 deg (thumb ~35)
+    }
+    return 0;
+}
+// Compressed bone data: our own format (only DecompressSkeletalBoneData reads it): a tag, then the parent-space bones.
+enum { BONE_TAG = 0x42585253 };   // "SRXB"
+static EVRInputError GetSkeletalBoneDataCompressed(VRActionHandle_t h, EVRSkeletalMotionRange range, void *buf, uint32_t size, uint32_t *needed) {
+    uint32_t n = 4 + sizeof(VRBoneTransform_t) * NBONES;
+    if (needed) *needed = n;
+    VRBoneTransform_t t[NBONES];
+    EVRInputError err = GetSkeletalBoneData(h, EVRSkeletalTransformSpace_VRSkeletalTransformSpace_Parent, range, t, NBONES);
+    if (err) return err;
+    if (!buf || size < n) return EVRInputError_VRInputError_BufferTooSmall;
+    uint32_t tag = BONE_TAG; memcpy(buf, &tag, 4); memcpy((char *)buf + 4, t, sizeof t);
+    return 0;
+}
+static EVRInputError DecompressSkeletalBoneData(void *buf, uint32_t size, EVRSkeletalTransformSpace space, VRBoneTransform_t *t, uint32_t n) {
+    uint32_t tag = 0;
+    if (!buf || size < 4 + sizeof(VRBoneTransform_t) * NBONES || (memcpy(&tag, buf, 4), tag != BONE_TAG)) return EVRInputError_VRInputError_InvalidCompressedData;
+    if (n != NBONES) return EVRInputError_VRInputError_InvalidBoneCount;
+    memcpy(t, (char *)buf + 4, sizeof(VRBoneTransform_t) * NBONES);
+    if (space == EVRSkeletalTransformSpace_VRSkeletalTransformSpace_Model) to_model_space(t);
+    return 0;
 }
 
 // ---------------------------------------------------------------- IVRSystem
@@ -488,52 +693,127 @@ static void GetDeviceToAbsoluteTrackingPose(ETrackingUniverseOrigin o, float t, 
 static HmdMatrix34_t identity34(void) { return (HmdMatrix34_t){{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}}; }
 static HmdMatrix34_t GetSeatedZeroPoseToStandingAbsoluteTrackingPose(void) { return identity34(); }
 
+// Device 0 is the headset, 1/2 the Touch controllers; they report what SteamVR reports for a Quest 2 over Link. The
+// shared memory carries no battery level: batteries read full and DeviceProvidesBatteryStatus is false.
+static int prop_device(TrackedDeviceIndex_t i, ETrackedPropertyError *err) {
+    if (err) *err = i > 2 ? ETrackedPropertyError_TrackedProp_InvalidDevice : ETrackedPropertyError_TrackedProp_Success;
+    return i <= 2;
+}
+static void unknown(ETrackedPropertyError *err) { if (err) *err = ETrackedPropertyError_TrackedProp_UnknownProperty; }
 static float GetFloatTrackedDeviceProperty(TrackedDeviceIndex_t i, ETrackedDeviceProperty p, ETrackedPropertyError *err) {
-    if (err) *err = ETrackedPropertyError_TrackedProp_Success;
-    if (p == ETrackedDeviceProperty_Prop_DisplayFrequency_Float) return fps();
-    if (p == ETrackedDeviceProperty_Prop_UserIpdMeters_Float) {
-        HmdMatrix34_t l = GetEyeToHeadTransform(EVREye_Eye_Left), r = GetEyeToHeadTransform(EVREye_Eye_Right);
-        return fabsf(r.m[0][3] - l.m[0][3]);
+    if (!prop_device(i, err)) return 0;
+    switch ((int)p) {
+    case ETrackedDeviceProperty_Prop_DeviceBatteryPercentage_Float: return 1;
+    case ETrackedDeviceProperty_Prop_DisplayFrequency_Float: if (i == 0) return fps(); break;
+    case ETrackedDeviceProperty_Prop_SecondsFromVsyncToPhotons_Float: if (i == 0) return 0.011f; break;
+    case ETrackedDeviceProperty_Prop_UserHeadToEyeDepthMeters_Float: if (i == 0) return 0; break;
+    case ETrackedDeviceProperty_Prop_UserIpdMeters_Float:
+        if (i == 0) { HmdMatrix34_t l = GetEyeToHeadTransform(EVREye_Eye_Left), r = GetEyeToHeadTransform(EVREye_Eye_Right); return fabsf(r.m[0][3] - l.m[0][3]); }
+        break;
     }
-    if (p == ETrackedDeviceProperty_Prop_SecondsFromVsyncToPhotons_Float) return 0.011f;
-    (void)i;
-    if (err) *err = ETrackedPropertyError_TrackedProp_UnknownProperty;
-    return 0;
+    unknown(err); return 0;
 }
 static uint32_t GetStringTrackedDeviceProperty(TrackedDeviceIndex_t i, ETrackedDeviceProperty p, char *v, uint32_t size, ETrackedPropertyError *err) {
+    if (!prop_device(i, err)) return 0;
     const char *s = NULL;
-    if (i > 2) { if (err) *err = ETrackedPropertyError_TrackedProp_InvalidDevice; return 0; }
     switch ((int)p) {
     case ETrackedDeviceProperty_Prop_TrackingSystemName_String: s = "oculus"; break;
     case ETrackedDeviceProperty_Prop_ManufacturerName_String: s = "Oculus"; break;
     case ETrackedDeviceProperty_Prop_ModelNumber_String: s = i == 0 ? "Oculus Quest2" : i == 1 ? "Oculus Quest2 (Left Controller)" : "Oculus Quest2 (Right Controller)"; break;
-    case ETrackedDeviceProperty_Prop_SerialNumber_String: s = i == 0 ? "MACVR-HMD" : i == 1 ? "MACVR-LEFT" : "MACVR-RIGHT"; break;
+    case ETrackedDeviceProperty_Prop_SerialNumber_String: case ETrackedDeviceProperty_Prop_ManufacturerSerialNumber_String:
+        s = i == 0 ? "MACVR-HMD" : i == 1 ? "MACVR-LEFT" : "MACVR-RIGHT"; break;
     case ETrackedDeviceProperty_Prop_RenderModelName_String: s = i == 0 ? "oculus_quest2" : i == 1 ? "oculus_quest2_controller_left" : "oculus_quest2_controller_right"; break;
     case ETrackedDeviceProperty_Prop_ControllerType_String: s = i == 0 ? "quest2_hmd" : "oculus_touch"; break;
+    case ETrackedDeviceProperty_Prop_RegisteredDeviceType_String: s = i == 0 ? "oculus/MACVR_HMD" : i == 1 ? "oculus/MACVR_Controller_Left" : "oculus/MACVR_Controller_Right"; break;
+    case ETrackedDeviceProperty_Prop_InputProfilePath_String: if (i) s = "{oculus}/input/touch_profile.json"; break;
+    case ETrackedDeviceProperty_Prop_TrackingFirmwareVersion_String: case ETrackedDeviceProperty_Prop_DriverVersion_String: s = "SiliconXR"; break;
+    case ETrackedDeviceProperty_Prop_HardwareRevision_String: s = "1"; break;
     }
-    if (!s) { if (err) *err = ETrackedPropertyError_TrackedProp_UnknownProperty; if (v && size) *v = 0; return 0; }
+    if (!s) { unknown(err); if (v && size) *v = 0; return 0; }
     uint32_t n = (uint32_t)strlen(s) + 1;
     if (!v || size < n) { if (err) *err = ETrackedPropertyError_TrackedProp_BufferTooSmall; return n; }
     memcpy(v, s, n);
-    if (err) *err = ETrackedPropertyError_TrackedProp_Success;
     return n;
 }
 static bool GetBoolTrackedDeviceProperty(TrackedDeviceIndex_t i, ETrackedDeviceProperty p, ETrackedPropertyError *err) {
-    (void)i; (void)p; if (err) *err = ETrackedPropertyError_TrackedProp_UnknownProperty; return false;
+    if (!prop_device(i, err)) return false;
+    switch ((int)p) {
+    case ETrackedDeviceProperty_Prop_DeviceIsWireless_Bool: return true;
+    case ETrackedDeviceProperty_Prop_WillDriftInYaw_Bool: case ETrackedDeviceProperty_Prop_DeviceIsCharging_Bool:
+    case ETrackedDeviceProperty_Prop_DeviceProvidesBatteryStatus_Bool: case ETrackedDeviceProperty_Prop_DeviceCanPowerOff_Bool:
+    case ETrackedDeviceProperty_Prop_Identifiable_Bool: case ETrackedDeviceProperty_Prop_HasCamera_Bool: case ETrackedDeviceProperty_Prop_IsOnDesktop_Bool:
+        return false;
+    case ETrackedDeviceProperty_Prop_ContainsProximitySensor_Bool: case ETrackedDeviceProperty_Prop_HasDisplayComponent_Bool: return i == 0;
+    case ETrackedDeviceProperty_Prop_HasControllerComponent_Bool: return i != 0;
+    }
+    unknown(err); return false;
 }
 static int32_t GetInt32TrackedDeviceProperty(TrackedDeviceIndex_t i, ETrackedDeviceProperty p, ETrackedPropertyError *err) {
-    if (p == ETrackedDeviceProperty_Prop_ControllerRoleHint_Int32) { if (err) *err = 0; return GetControllerRoleForTrackedDeviceIndex(i); }
-    if (err) *err = ETrackedPropertyError_TrackedProp_UnknownProperty; return 0;
+    if (!prop_device(i, err)) return 0;
+    switch ((int)p) {
+    case ETrackedDeviceProperty_Prop_DeviceClass_Int32: return GetTrackedDeviceClass(i);
+    case ETrackedDeviceProperty_Prop_ControllerRoleHint_Int32: return GetControllerRoleForTrackedDeviceIndex(i);
+    case ETrackedDeviceProperty_Prop_ControllerHandSelectionPriority_Int32: if (i) return 0; break;
+    case ETrackedDeviceProperty_Prop_Axis0Type_Int32: if (i) return EVRControllerAxisType_k_eControllerAxis_Joystick; break;
+    case ETrackedDeviceProperty_Prop_Axis1Type_Int32: case ETrackedDeviceProperty_Prop_Axis2Type_Int32: if (i) return EVRControllerAxisType_k_eControllerAxis_Trigger; break;
+    }
+    unknown(err); return 0;
 }
 static uint64_t GetUint64TrackedDeviceProperty(TrackedDeviceIndex_t i, ETrackedDeviceProperty p, ETrackedPropertyError *err) {
-    (void)i; (void)p; if (err) *err = ETrackedPropertyError_TrackedProp_UnknownProperty; return 0;
+    if (!prop_device(i, err)) return 0;
+    switch ((int)p) {
+    case ETrackedDeviceProperty_Prop_HardwareRevision_Uint64: case ETrackedDeviceProperty_Prop_FirmwareVersion_Uint64: return 1;
+    case ETrackedDeviceProperty_Prop_CurrentUniverseId_Uint64: return 1;
+    case ETrackedDeviceProperty_Prop_SupportedButtons_Uint64:
+        return i == 0 ? 1ULL << EVRButtonId_k_EButton_ProximitySensor
+                      : 1ULL << EVRButtonId_k_EButton_ApplicationMenu | 1ULL << EVRButtonId_k_EButton_Grip | 1ULL << EVRButtonId_k_EButton_A |
+                        1ULL << EVRButtonId_k_EButton_SteamVR_Touchpad | 1ULL << EVRButtonId_k_EButton_SteamVR_Trigger | 1ULL << (EVRButtonId_k_EButton_SteamVR_Trigger + 1);
+    }
+    unknown(err); return 0;
 }
+/// The lens mask (siliconxr_shared.h) in the eye texture's 0..1 coordinates (top left origin). Vivecraft stencils
+/// it out so the hidden corners are never shaded.
 static HiddenAreaMesh_t GetHiddenAreaMesh(EVREye e, EHiddenAreaMeshType t) {
-    (void)e; (void)t;
-    static HmdVector2_t degenerate[3];   // one empty triangle: nothing hidden, but never a NULL buffer
-    return (HiddenAreaMesh_t){degenerate, 1};
+    (void)e;
+    static HmdVector2_t verts[3][6 * SXR_MASK_N]; static uint32_t count[3]; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        float tri[2 * SXR_MASK_N][3][2], ring[SXR_MASK_N][2], rect[SXR_MASK_N][2];
+        for (int type = 0; type < 2; type++) {   // 0 standard = hidden corners, 1 inverse = visible area
+            int n = sxr_mask_triangles(type == 0, tri);
+            for (int k = 0; k < n; k++) for (int v = 0; v < 3; v++) verts[type][3 * k + v] = (HmdVector2_t){{(tri[k][v][0] + 1) / 2, (1 - tri[k][v][1]) / 2}};
+            count[type] = (uint32_t)n;
+        }
+        sxr_mask_ring(ring, rect);   // line loop: unTriangleCount is the vertex count
+        for (int k = 0; k < SXR_MASK_N; k++) verts[2][k] = (HmdVector2_t){{(ring[k][0] + 1) / 2, (1 - ring[k][1]) / 2}};
+        count[2] = SXR_MASK_N;
+    });
+    if (t < 0 || t > 2) return (HiddenAreaMesh_t){NULL, 0};
+    return (HiddenAreaMesh_t){verts[t], count[t]};
 }
-static bool PollNextEvent(struct VREvent_t *e, uint32_t size) { (void)e; (void)size; return false; }
+/// Events: devices appear at start; a hand switching between its controller and hand tracking is a device update
+/// (Vivecraft then re-reads the controller's aim transform); MacVR's menu opening and closing is the dashboard.
+static bool PollNextEvent(struct VREvent_t *e, uint32_t size) {
+    static uint32_t queue[16][2]; static int head, tail, started, tracked[2], dash;
+    #define PUSH(type, dev) do { if (tail - head < 16) { queue[tail % 16][0] = (type); queue[tail % 16][1] = (dev); tail++; } } while (0)
+    if (!started) {
+        started = 1;
+        for (uint32_t d = 0; d < 3; d++) PUSH(EVREventType_VREvent_TrackedDeviceActivated, d);
+        if (shm) { tracked[0] = shm->hand_joints[0].tracked != 0; tracked[1] = shm->hand_joints[1].tracked != 0; dash = shm->input_blocked != 0; }
+    }
+    for (int h = 0; shm && h < 2; h++) {
+        int t = shm->hand_joints[h].tracked != 0;
+        if (t != tracked[h]) { tracked[h] = t; PUSH(EVREventType_VREvent_TrackedDeviceUpdated, (uint32_t)h + 1); }
+    }
+    if (shm && (shm->input_blocked != 0) != dash) {
+        dash = !dash; PUSH(dash ? EVREventType_VREvent_DashboardActivated : EVREventType_VREvent_DashboardDeactivated, 0);
+    }
+    #undef PUSH
+    if (head == tail || !e || size < 12) return false;
+    memset(e, 0, size);
+    e->eventType = queue[head % 16][0]; e->trackedDeviceIndex = queue[head % 16][1]; e->eventAgeSeconds = 0;
+    head++;
+    return true;
+}
 static bool ShouldApplicationPause(void) { return false; }
 static bool IsInputAvailable(void) { return !(shm && shm->input_blocked); }
 
@@ -587,11 +867,8 @@ static bool GetControllerStateWithPose(ETrackingUniverseOrigin o, TrackedDeviceI
 
 static void TriggerHapticPulse(TrackedDeviceIndex_t i, uint32_t axis, unsigned short durUs) {
     (void)axis;
-    if ((i != 1 && i != 2) || !shm) return;
-    float dur = durUs > 0 ? (float)durUs / 1000000.0f : 0.02f;
-    shm->haptic = (VR4Haptics){(uint8_t)(i - 1), 1.0f, dur, 160.0f};
-    vr4_fence();
-    shm->haptic_seq++;
+    if (i != 1 && i != 2) return;
+    sxr_haptic(shm, (int)i - 1, 1, durUs > 0 ? (float)durUs / 1000000.0f : 0.02f, 160, 0);
 }
 
 /// MacVR shows this as the game's name (the window title, e.g. "Minecraft* 1.20.1"). AppKit is only touched on the
@@ -633,9 +910,64 @@ static EVRCompositorError GetLastPoses(TrackedDevicePose_t *render, uint32_t nr,
     return EVRCompositorError_VRCompositorError_None;
 }
 
-/// Reads an OpenGL eye texture into this frame's side-by-side shm buffer (top row first), flipping on the GPU
-/// with a blit. Publishes the frame after the right eye.
-// ponytail: synchronous glReadPixels (one GPU sync per eye); move to a PBO ring if Minecraft frame times suffer.
+/// Reads an OpenGL eye texture into a side-by-side frame (top row first), flipping on the GPU with a blit.
+/// GL 3+ contexts: each eye goes into a pixel buffer object without waiting, a fence follows the right eye, and a worker
+/// thread with a context shared with the game's copies the frame into shm once the GPU is done, so the render thread
+/// never stalls on the GPU. Legacy (2.1) contexts read back synchronously.
+/// FadeToColor: the color animates from the current one to the target over the given time and is blended over the
+/// submitted frames (the background fade only applies to SteamVR's own scene, so it is just reported back).
+static struct { HmdColor_t from, to; uint64_t start, dur; } fade[2];   // [background]
+static HmdColor_t fade_color(int bg) {
+    uint64_t t = now_ns();
+    float k = fade[bg].dur && t < fade[bg].start + fade[bg].dur ? (float)(t - fade[bg].start) / fade[bg].dur : 1;
+    HmdColor_t a = fade[bg].from, b = fade[bg].to;
+    return (HmdColor_t){a.r + (b.r - a.r) * k, a.g + (b.g - a.g) * k, a.b + (b.b - a.b) * k, a.a + (b.a - a.a) * k};
+}
+static void FadeToColor(float seconds, float r, float g, float b, float a, bool bg) {
+    fade[bg != 0].from = fade_color(bg != 0); fade[bg != 0].to = (HmdColor_t){r, g, b, a};
+    fade[bg != 0].start = now_ns(); fade[bg != 0].dur = seconds > 0 ? (uint64_t)(seconds * 1e9) : 0;
+}
+static void apply_fade(uint8_t *bgra, size_t pixels, HmdColor_t c) {
+    if (c.a < 0.004f) return;
+    uint32_t a = (uint32_t)(fminf(c.a, 1) * 256), na = 256 - a;
+    uint32_t cb = (uint32_t)(fminf(c.b, 1) * 255) * a, cg = (uint32_t)(fminf(c.g, 1) * 255) * a, cr = (uint32_t)(fminf(c.r, 1) * 255) * a;
+    for (size_t i = 0; i < pixels; i++, bgra += 4) {
+        bgra[0] = (uint8_t)((bgra[0] * na + cb) >> 8); bgra[1] = (uint8_t)((bgra[1] * na + cg) >> 8); bgra[2] = (uint8_t)((bgra[2] * na + cr) >> 8);
+    }
+}
+
+enum { NPBO = 3 };
+typedef struct { GLuint pbo; size_t size; uint32_t w, h; VR4Pose pose[2]; uint64_t time; volatile int busy; } Pbo;
+static Pbo pbos[NPBO]; static int pboCur = -1;   // slot being filled by this frame's Submits (-1: none / dropped)
+static CGLContextObj gameCtx, workerCtx;
+static dispatch_queue_t worker_queue(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("SiliconXR.readback", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+static void publish_frame(uint32_t buf, uint32_t w, uint32_t h, const VR4Pose pose[2], uint64_t time) {
+    apply_fade(vr4_frame(shm, buf), (size_t)2 * w * h, fade_color(0));
+    shm->frame_eye_pose[buf][0] = pose[0]; shm->frame_eye_pose[buf][1] = pose[1];
+    shm->frame_w[buf] = 2 * w; shm->frame_h[buf] = h; shm->frame_rgba[buf] = 0;
+    shm->frame_time_ns[buf] = time;
+    shm->runtime_heartbeat_ns = now_ns();
+    vr4_fence();
+    shm->frame_seq++;
+}
+/// GL 3+ and a worker context sharing the current context's objects; 0 = read back synchronously.
+static int async_gl(void) {
+    CGLContextObj ctx = CGLGetCurrentContext();
+    if (ctx == gameCtx) return workerCtx != NULL;
+    dispatch_sync(worker_queue(), ^{});   // the old context's frames are done
+    if (workerCtx) CGLDestroyContext(workerCtx);
+    workerCtx = NULL; gameCtx = ctx; pboCur = -1;
+    readFbo = drawFbo = drawRbo = 0; rboW = rboH = 0;   // framebuffers are per context: make new ones
+    for (int k = 0; k < NPBO; k++) pbos[k] = (Pbo){0};   // they belonged to the old context
+    const char *v = (const char *)glGetString(GL_VERSION);
+    if (ctx && v && atoi(v) >= 3 && CGLCreateContext(CGLGetPixelFormat(ctx), ctx, &workerCtx) != kCGLNoError) workerCtx = NULL;
+    logmsg("GL %s: %s readback", v ? v : "?", workerCtx ? "asynchronous" : "synchronous");
+    return workerCtx != NULL;
+}
 static uint32_t frameW, frameH;
 static EVRCompositorError Submit(EVREye eye, Texture_t *tex, VRTextureBounds_t *bounds, EVRSubmitFlags flags) {
     (void)flags;
@@ -657,7 +989,18 @@ static EVRCompositorError Submit(EVREye eye, Texture_t *tex, VRTextureBounds_t *
     uint32_t w = (uint32_t)abs(sx1 - sx0), h = (uint32_t)abs(sy1 - sy0);
     while (2ull * w * h * 4 > VR4_FRAME_MAX) { w = w * 7 / 8; h = h * 7 / 8; }   // stay inside the shm frame
     if (!w || !h) return EVRCompositorError_VRCompositorError_InvalidBounds;
-    if (eye == EVREye_Eye_Left || frameW != w || frameH != h) { frameW = w; frameH = h; }
+    uint32_t e = eye == EVREye_Eye_Right;
+    if (!e || frameW != w || frameH != h) { frameW = w; frameH = h; }
+    int async = async_gl();
+    Pbo *slot = NULL;
+    if (async) {
+        if (!e) {   // a new frame: a free buffer, else drop the frame (the GPU is several frames behind)
+            pboCur = -1;
+            for (int k = 0; k < NPBO && pboCur < 0; k++) if (!__atomic_load_n(&pbos[k].busy, __ATOMIC_ACQUIRE)) pboCur = k;
+        }
+        if (pboCur < 0 || (e && (pbos[pboCur].w != w || pbos[pboCur].h != h))) { pboCur = -1; return EVRCompositorError_VRCompositorError_None; }
+        slot = &pbos[pboCur];
+    }
 
     if (!readFbo) { glGenFramebuffers(1, &readFbo); glGenFramebuffers(1, &drawFbo); glGenRenderbuffers(1, &drawRbo); }
     if (rboW != w || rboH != h) {
@@ -671,24 +1014,52 @@ static EVRCompositorError Submit(EVREye eye, Texture_t *tex, VRTextureBounds_t *
     glDisable(GL_SCISSOR_TEST);
     glBlitFramebuffer(sx0, sy0, sx1, sy1, 0, (GLint)h, (GLint)w, 0, GL_COLOR_BUFFER_BIT, w == (uint32_t)abs(sx1 - sx0) ? GL_NEAREST : GL_LINEAR);
 
-    uint32_t buf = (shm->frame_seq + 1) % 2, e = eye == EVREye_Eye_Right;
+    uint32_t buf = (shm->frame_seq + 1) % 2;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, drawFbo);
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(2 * w)); glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, vr4_frame(shm, buf) + (size_t)e * w * 4);
+    if (slot) {
+        size_t size = (size_t)2 * w * h * 4;
+        if (!slot->pbo) glGenBuffers(1, &slot->pbo);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, slot->pbo);
+        if (slot->size != size) { glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)size, NULL, GL_STREAM_READ); slot->size = size; }
+        slot->w = w; slot->h = h; slot->pose[e] = renderHead; slot->time = renderTime;
+        glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, (void *)(uintptr_t)(e * w * 4));
+    } else {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, vr4_frame(shm, buf) + (size_t)e * w * 4);
+    }
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevRead); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prevDraw);
     glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)prevRb); glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prevPbo);
     glPixelStorei(GL_PACK_ROW_LENGTH, prevPack); glPixelStorei(GL_PACK_ALIGNMENT, prevAlign);
     if (scissor) glEnable(GL_SCISSOR_TEST);
 
-    shm->frame_eye_pose[buf][e] = renderHead;
-    if (e) {
-        shm->frame_w[buf] = 2 * w; shm->frame_h[buf] = h; shm->frame_rgba[buf] = 0;
-        shm->frame_time_ns[buf] = renderTime;
-        shm->runtime_heartbeat_ns = now_ns();
-        vr4_fence();
-        shm->frame_seq++;
+    if (!slot) {
+        shm->frame_eye_pose[buf][e] = renderHead;
+        if (e) { VR4Pose p[2] = {shm->frame_eye_pose[buf][0], renderHead}; publish_frame(buf, w, h, p, renderTime); }
+    } else if (e) {   // frame complete: hand it to the worker
+        GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush();   // the worker's context only sees the fence once it is flushed
+        __atomic_store_n(&slot->busy, 1, __ATOMIC_RELEASE);
+        pboCur = -1;
+        CGLContextObj ctx = workerCtx;
+        dispatch_async(worker_queue(), ^{
+            CGLSetCurrentContext(ctx);
+            if (glClientWaitSync(fence, 0, 1000000000ull) != GL_TIMEOUT_EXPIRED) {
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, slot->pbo);
+                const void *src = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)slot->size, GL_MAP_READ_BIT);
+                if (src) {
+                    uint32_t fb = (shm->frame_seq + 1) % 2;
+                    memcpy(vr4_frame(shm, fb), src, slot->size);
+                    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                    publish_frame(fb, slot->w, slot->h, slot->pose, slot->time);
+                }
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            }
+            glDeleteSync(fence);
+            CGLSetCurrentContext(NULL);
+            __atomic_store_n(&slot->busy, 0, __ATOMIC_RELEASE);
+        });
     }
     return EVRCompositorError_VRCompositorError_None;
 }
@@ -712,23 +1083,37 @@ static EVRCompositorError GetLastPoseForTrackedDeviceIndex(TrackedDeviceIndex_t 
     if (game) *game = p;
     return EVRCompositorError_VRCompositorError_None;
 }
-static void FadeToColor(float fSeconds, float fRed, float fGreen, float fBlue, float fAlpha, bool bBackground) {
-    (void)fSeconds; (void)fRed; (void)fGreen; (void)fBlue; (void)fAlpha; (void)bBackground;
-}
-static struct HmdColor_t GetCurrentFadeColor(bool bBackground) {
-    (void)bBackground;
-    return (struct HmdColor_t){0, 0, 0, 0};
-}
+static struct HmdColor_t GetCurrentFadeColor(bool bBackground) { return fade_color(bBackground != 0); }
 
 // ---------------------------------------------------------------- IVRChaperone / IVRRenderModels / IVRSettings / IVRApplications
+// Play area: 2 x 2 m around the standing origin, in game units (world scale), as the OpenXR stage bounds. The walls
+// are 2.43 m high (SteamVR's default). MacVR draws no bounds, so they are never visible.
 static ChaperoneCalibrationState GetCalibrationState(void) { return ChaperoneCalibrationState_OK; }
-static bool GetPlayAreaSize(float *x, float *z) { *x = 2; *z = 2; return true; }
+static bool GetPlayAreaSize(float *x, float *z) { if (x) *x = 2 / world_scale(); if (z) *z = 2 / world_scale(); return true; }
 static bool GetPlayAreaRect(HmdQuad_t *q) {
-    float c[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
-    for (int i = 0; i < 4; i++) q->vCorners[i] = (HmdVector3_t){{c[i][0], 0, c[i][1]}};
+    float c[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}}, s = 1 / world_scale();
+    for (int i = 0; q && i < 4; i++) q->vCorners[i] = (HmdVector3_t){{c[i][0] * s, 0, c[i][1] * s}};
+    return q != NULL;
+}
+static bool GetCollisionBounds(HmdQuad_t *quads, uint32_t *n) {   // one wall per side of the play area
+    uint32_t cap = n ? *n : 0;
+    if (n) *n = 4;
+    HmdQuad_t r;
+    if (!quads || cap < 4 || !GetPlayAreaRect(&r)) return false;
+    for (int i = 0; i < 4; i++) {
+        HmdVector3_t a = r.vCorners[i], b = r.vCorners[(i + 1) % 4], ah = a, bh = b;
+        ah.v[1] = bh.v[1] = 2.43f / world_scale();
+        quads[i] = (HmdQuad_t){{a, b, bh, ah}};
+    }
     return true;
 }
+static bool GetStandingZeroPose(HmdMatrix34_t *m) { if (m) *m = (HmdMatrix34_t){{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}}; return m != NULL; }
 static bool AreBoundsVisible(void) { return false; }
+static void GetBoundsColor(HmdColor_t *colors, int n, float fade, HmdColor_t *camera) {
+    (void)fade;
+    for (int i = 0; colors && i < n; i++) colors[i] = (HmdColor_t){0, 0.6f, 1, 1};   // SteamVR's default cyan
+    if (camera) *camera = (HmdColor_t){0, 0.6f, 1, 1};
+}
 
 static uint32_t GetRenderModelCount(void) { return 2; }
 static uint64_t GetComponentButtonMask(char *model, char *comp) { (void)model; (void)comp; return 0; }
@@ -760,6 +1145,147 @@ static bool IsApplicationInstalled(char *key) { (void)key; return true; }
 static EVRApplicationError IdentifyApplication(uint32_t pid, char *key) { (void)pid; logmsg("app %s", key); return EVRApplicationError_VRApplicationError_None; }
 static char *GetApplicationsErrorNameFromEnum(EVRApplicationError e) { return e ? "VRApplicationError_Unknown" : "VRApplicationError_None"; }
 
+// ---------------------------------------------------------------- IVROverlay
+// Overlays are bookkept (keys, names, flags, colors, sizes, transforms, visibility, textures) so apps that create them
+// get consistent answers, and ComputeOverlayIntersection hit-tests them. MacVR has no system keyboard or message box:
+// ShowKeyboard fails with RequestFailed, so apps (Vivecraft) use their own keyboards.
+// ponytail: overlay textures are not drawn into the frames; composite them in Submit if an app needs it.
+typedef struct {
+    int used, visible; char key[256], name[256]; uint32_t flags, sortOrder; float color[3], alpha, texelAspect, width, curvature, pitch;
+    EColorSpace colorSpace; VRTextureBounds_t bounds; VROverlayTransformType ttype; ETrackingUniverseOrigin origin; HmdMatrix34_t xf;
+    TrackedDeviceIndex_t device; Texture_t tex; int hasTex; VROverlayInputMethod input; HmdVector2_t mouseScale;
+} Overlay;
+static Overlay overlays[64];
+static Overlay *ov(VROverlayHandle_t h) { return h >= 1 && h <= 64 && overlays[h - 1].used ? &overlays[h - 1] : NULL; }
+#define OV(h) Overlay *o = ov(h); if (!o) return EVROverlayError_VROverlayError_UnknownOverlay
+static EVROverlayError FindOverlay(char *key, VROverlayHandle_t *h) {
+    for (int i = 0; i < 64; i++) if (overlays[i].used && !strcmp(overlays[i].key, key)) { *h = (VROverlayHandle_t)i + 1; return 0; }
+    *h = 0; return EVROverlayError_VROverlayError_UnknownOverlay;
+}
+static EVROverlayError CreateOverlay(char *key, char *name, VROverlayHandle_t *h) {
+    *h = 0;
+    if (strlen(key) >= 256) return EVROverlayError_VROverlayError_KeyTooLong;
+    if (strlen(name) >= 256) return EVROverlayError_VROverlayError_NameTooLong;
+    VROverlayHandle_t found;
+    if (FindOverlay(key, &found) == 0) return EVROverlayError_VROverlayError_KeyInUse;
+    for (int i = 0; i < 64; i++) if (!overlays[i].used) {
+        overlays[i] = (Overlay){.used = 1, .color = {1, 1, 1}, .alpha = 1, .texelAspect = 1, .width = 1, .bounds = {0, 0, 1, 1},
+                                .ttype = VROverlayTransformType_VROverlayTransform_Absolute, .origin = ETrackingUniverseOrigin_TrackingUniverseStanding,
+                                .xf = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}}, .mouseScale = {{1, 1}}};
+        snprintf(overlays[i].key, 256, "%s", key); snprintf(overlays[i].name, 256, "%s", name);
+        *h = (VROverlayHandle_t)i + 1; return 0;
+    }
+    return EVROverlayError_VROverlayError_OverlayLimitExceeded;
+}
+static EVROverlayError DestroyOverlay(VROverlayHandle_t h) { OV(h); o->used = 0; return 0; }
+static uint32_t copy_str(const char *s, char *v, uint32_t size) { uint32_t n = (uint32_t)strlen(s) + 1; if (v && size >= n) memcpy(v, s, n); return n; }
+static uint32_t GetOverlayKey(VROverlayHandle_t h, char *v, uint32_t size, EVROverlayError *err) {
+    Overlay *o = ov(h); if (err) *err = o ? 0 : EVROverlayError_VROverlayError_UnknownOverlay; return o ? copy_str(o->key, v, size) : 0;
+}
+static uint32_t GetOverlayName(VROverlayHandle_t h, char *v, uint32_t size, EVROverlayError *err) {
+    Overlay *o = ov(h); if (err) *err = o ? 0 : EVROverlayError_VROverlayError_UnknownOverlay; return o ? copy_str(o->name, v, size) : 0;
+}
+static EVROverlayError SetOverlayName(VROverlayHandle_t h, char *name) { OV(h); snprintf(o->name, 256, "%s", name); return 0; }
+static char *GetOverlayErrorNameFromEnum(EVROverlayError e) {
+    switch ((int)e) {
+    case 0: return "VROverlayError_None"; case 10: return "VROverlayError_UnknownOverlay"; case 13: return "VROverlayError_OverlayLimitExceeded";
+    case 17: return "VROverlayError_KeyInUse"; case 18: return "VROverlayError_WrongTransformType"; case 23: return "VROverlayError_RequestFailed";
+    default: return "VROverlayError_Unknown";
+    }
+}
+static EVROverlayError SetOverlayFlag(VROverlayHandle_t h, VROverlayFlags f, bool on) {
+    OV(h); if ((unsigned)f > 31) return EVROverlayError_VROverlayError_InvalidParameter;
+    o->flags = on ? o->flags | 1u << f : o->flags & ~(1u << f); return 0;
+}
+static EVROverlayError GetOverlayFlag(VROverlayHandle_t h, VROverlayFlags f, bool *on) { OV(h); *on = (unsigned)f < 32 && (o->flags >> f & 1); return 0; }
+static EVROverlayError GetOverlayFlags(VROverlayHandle_t h, uint32_t *f) { OV(h); *f = o->flags; return 0; }
+static EVROverlayError SetOverlayColor(VROverlayHandle_t h, float r, float g, float b) { OV(h); o->color[0] = r; o->color[1] = g; o->color[2] = b; return 0; }
+static EVROverlayError GetOverlayColor(VROverlayHandle_t h, float *r, float *g, float *b) { OV(h); *r = o->color[0]; *g = o->color[1]; *b = o->color[2]; return 0; }
+#define SETGET(Name, field, T) \
+    static EVROverlayError SetOverlay##Name(VROverlayHandle_t h, T v) { OV(h); o->field = v; return 0; } \
+    static EVROverlayError GetOverlay##Name(VROverlayHandle_t h, T *v) { OV(h); if (v) *v = o->field; return 0; }
+SETGET(Alpha, alpha, float) SETGET(TexelAspect, texelAspect, float) SETGET(SortOrder, sortOrder, uint32_t)
+SETGET(Curvature, curvature, float) SETGET(PreCurvePitch, pitch, float) SETGET(TextureColorSpace, colorSpace, EColorSpace)
+SETGET(InputMethod, input, VROverlayInputMethod)
+#undef SETGET
+static EVROverlayError SetOverlayWidthInMeters(VROverlayHandle_t h, float w) { OV(h); if (w <= 0) return EVROverlayError_VROverlayError_InvalidParameter; o->width = w; return 0; }
+static EVROverlayError GetOverlayWidthInMeters(VROverlayHandle_t h, float *w) { OV(h); *w = o->width; return 0; }
+static EVROverlayError SetOverlayTextureBounds(VROverlayHandle_t h, VRTextureBounds_t *b) { OV(h); o->bounds = *b; return 0; }
+static EVROverlayError GetOverlayTextureBounds(VROverlayHandle_t h, VRTextureBounds_t *b) { OV(h); *b = o->bounds; return 0; }
+static EVROverlayError GetOverlayTransformType(VROverlayHandle_t h, VROverlayTransformType *t) { OV(h); *t = o->ttype; return 0; }
+static EVROverlayError SetOverlayTransformAbsolute(VROverlayHandle_t h, ETrackingUniverseOrigin origin, HmdMatrix34_t *m) {
+    OV(h); o->ttype = VROverlayTransformType_VROverlayTransform_Absolute; o->origin = origin; o->xf = *m; return 0;
+}
+static EVROverlayError GetOverlayTransformAbsolute(VROverlayHandle_t h, ETrackingUniverseOrigin *origin, HmdMatrix34_t *m) {
+    OV(h); if (o->ttype != VROverlayTransformType_VROverlayTransform_Absolute) return EVROverlayError_VROverlayError_WrongTransformType;
+    *origin = o->origin; *m = o->xf; return 0;
+}
+static EVROverlayError SetOverlayTransformTrackedDeviceRelative(VROverlayHandle_t h, TrackedDeviceIndex_t d, HmdMatrix34_t *m) {
+    OV(h); if (d > 2) return EVROverlayError_VROverlayError_InvalidTrackedDevice;
+    o->ttype = VROverlayTransformType_VROverlayTransform_TrackedDeviceRelative; o->device = d; o->xf = *m; return 0;
+}
+static EVROverlayError GetOverlayTransformTrackedDeviceRelative(VROverlayHandle_t h, TrackedDeviceIndex_t *d, HmdMatrix34_t *m) {
+    OV(h); if (o->ttype != VROverlayTransformType_VROverlayTransform_TrackedDeviceRelative) return EVROverlayError_VROverlayError_WrongTransformType;
+    *d = o->device; *m = o->xf; return 0;
+}
+static EVROverlayError ShowOverlay(VROverlayHandle_t h) { OV(h); o->visible = 1; return 0; }
+static EVROverlayError HideOverlay(VROverlayHandle_t h) { OV(h); o->visible = 0; return 0; }
+static bool IsOverlayVisible(VROverlayHandle_t h) { Overlay *o = ov(h); return o && o->visible; }
+static bool PollNextOverlayEvent(VROverlayHandle_t h, struct VREvent_t *e, uint32_t size) { (void)h; (void)e; (void)size; return false; }
+static EVROverlayError SetOverlayMouseScale(VROverlayHandle_t h, HmdVector2_t *s) { OV(h); o->mouseScale = *s; return 0; }
+static EVROverlayError GetOverlayMouseScale(VROverlayHandle_t h, HmdVector2_t *s) { OV(h); *s = o->mouseScale; return 0; }
+static EVROverlayError SetOverlayTexture(VROverlayHandle_t h, Texture_t *t) { OV(h); if (!t) return EVROverlayError_VROverlayError_InvalidTexture; o->tex = *t; o->hasTex = 1; return 0; }
+static EVROverlayError ClearOverlayTexture(VROverlayHandle_t h) { OV(h); o->hasTex = 0; return 0; }
+/// Overlay -> tracking space: absolute, or relative to a device's current pose.
+static HmdMatrix34_t overlay_xf(Overlay *o) {
+    if (o->ttype != VROverlayTransformType_VROverlayTransform_TrackedDeviceRelative) return o->xf;
+    read_tracking();
+    return mul34(mat(o->device == 0 ? track.head : track.hand[o->device - 1].grip), o->xf);
+}
+/// Ray (tracking space) against the overlay's quad: width x width * aspect of its texture bounds, facing +Z.
+static bool ComputeOverlayIntersection(VROverlayHandle_t h, VROverlayIntersectionParams_t *p, VROverlayIntersectionResults_t *r) {
+    Overlay *o = ov(h);
+    if (!o || !o->visible) return false;
+    HmdMatrix34_t m = overlay_xf(o), inv = inv34(m);
+    float s[3], d[3];
+    for (int i = 0; i < 3; i++) {
+        s[i] = inv.m[i][0] * p->vSource.v[0] + inv.m[i][1] * p->vSource.v[1] + inv.m[i][2] * p->vSource.v[2] + inv.m[i][3];
+        d[i] = inv.m[i][0] * p->vDirection.v[0] + inv.m[i][1] * p->vDirection.v[1] + inv.m[i][2] * p->vDirection.v[2];
+    }
+    if (fabsf(d[2]) < 1e-6f) return false;
+    float t = -s[2] / d[2], x = s[0] + t * d[0], y = s[1] + t * d[1];
+    float bw = fabsf(o->bounds.uMax - o->bounds.uMin), bh = fabsf(o->bounds.vMax - o->bounds.vMin);
+    float hgt = o->width * (bw > 0 ? bh / bw : 1) * o->texelAspect;   // texture aspect is not known: square texels on the bounds
+    if (t < 0 || fabsf(x) > o->width / 2 || fabsf(y) > hgt / 2) return false;
+    for (int i = 0; i < 3; i++) {
+        r->vPoint.v[i] = m.m[i][0] * x + m.m[i][1] * y + m.m[i][3];
+        r->vNormal.v[i] = m.m[i][2];
+    }
+    r->vUVs = (HmdVector2_t){{x / o->width + 0.5f, y / hgt + 0.5f}};
+    r->fDistance = t * sqrtf(p->vDirection.v[0] * p->vDirection.v[0] + p->vDirection.v[1] * p->vDirection.v[1] + p->vDirection.v[2] * p->vDirection.v[2]);
+    return true;
+}
+static EVROverlayError CreateDashboardOverlay(char *key, char *name, VROverlayHandle_t *main, VROverlayHandle_t *thumb) {
+    char tk[300]; snprintf(tk, sizeof tk, "%s.thumbnail", key);
+    EVROverlayError e = CreateOverlay(key, name, main);
+    if (!e && (e = CreateOverlay(tk, name, thumb))) { DestroyOverlay(*main); *main = 0; }
+    return e;
+}
+static bool IsDashboardVisible(void) { return shm && shm->input_blocked; }   // MacVR's menu
+static bool IsActiveDashboardOverlay(VROverlayHandle_t h) { (void)h; return false; }
+static TrackedDeviceIndex_t GetPrimaryDashboardDevice(void) { return k_unTrackedDeviceIndexInvalid; }
+static EVROverlayError ShowKeyboard(EGamepadTextInputMode m, EGamepadTextInputLineMode l, uint32_t f, char *d, uint32_t n, char *t, uint64_t u) {
+    (void)m; (void)l; (void)f; (void)d; (void)n; (void)t; (void)u; return EVROverlayError_VROverlayError_RequestFailed;
+}
+static EVROverlayError ShowKeyboardForOverlay(VROverlayHandle_t h, EGamepadTextInputMode m, EGamepadTextInputLineMode l, uint32_t f, char *d, uint32_t n, char *t, uint64_t u) {
+    (void)h; return ShowKeyboard(m, l, f, d, n, t, u);
+}
+static uint32_t GetKeyboardText(char *t, uint32_t n) { if (t && n) *t = 0; return 1; }
+static VRMessageOverlayResponse ShowMessageOverlay(char *t, char *c, char *b0, char *b1, char *b2, char *b3) {
+    logmsg("message overlay: %s: %s", c ? c : "", t ? t : ""); (void)b0; (void)b1; (void)b2; (void)b3;
+    return VRMessageOverlayResponse_CouldntFindSystemOverlay;
+}
+
 // ---------------------------------------------------------------- tables
 static uintptr_t stub(void) { return 0; }   // every slot we don't implement: returns 0 / false / None
 #define FILL(t) for (size_t _i = 0; _i < sizeof(t) / sizeof(void *); _i++) ((void **)&(t))[_i] = (void *)stub
@@ -771,10 +1297,11 @@ static struct VR_IVRChaperoneSetup_FnTable chapSetup;
 static struct VR_IVRRenderModels_FnTable models;
 static struct VR_IVRSettings_FnTable settings;
 static struct VR_IVRApplications_FnTable apps;
+static struct VR_IVROverlay_FnTable overlay;
 static void *comp028[sizeof comp / sizeof(void *) + 1];   // IVRCompositor_028 (OpenVR 2.x) = 027 + SubmitWithArrayIndex after Submit
 
 static void build_tables(void) {
-    FILL(sys); FILL(comp); FILL(input); FILL(chap); FILL(chapSetup); FILL(models); FILL(settings); FILL(apps);
+    FILL(sys); FILL(comp); FILL(input); FILL(chap); FILL(chapSetup); FILL(models); FILL(settings); FILL(apps); FILL(overlay);
     sys.GetRecommendedRenderTargetSize = GetRecommendedRenderTargetSize; sys.GetProjectionMatrix = GetProjectionMatrix;
     sys.GetProjectionRaw = GetProjectionRaw; sys.ComputeDistortion = ComputeDistortion; sys.GetEyeToHeadTransform = GetEyeToHeadTransform;
     sys.GetDeviceToAbsoluteTrackingPose = GetDeviceToAbsoluteTrackingPose;
@@ -808,10 +1335,19 @@ static void build_tables(void) {
     input.GetAnalogActionData = GetAnalogActionData; input.GetPoseActionDataForNextFrame = GetPoseActionDataForNextFrame;
     input.GetActionOrigins = GetActionOrigins; input.GetOriginLocalizedName = GetOriginLocalizedName;
     input.GetOriginTrackedDeviceInfo = GetOriginTrackedDeviceInfo; input.TriggerHapticVibrationAction = TriggerHapticVibrationAction;
+    input.GetPoseActionDataRelativeToNow = GetPoseActionDataRelativeToNow;
+    input.GetSkeletalActionData = GetSkeletalActionData; input.GetDominantHand = GetDominantHand; input.SetDominantHand = SetDominantHand;
+    input.GetBoneCount = GetBoneCount; input.GetBoneHierarchy = GetBoneHierarchy; input.GetBoneName = GetBoneName;
+    input.GetSkeletalReferenceTransforms = GetSkeletalReferenceTransforms; input.GetSkeletalTrackingLevel = GetSkeletalTrackingLevel;
+    input.GetSkeletalBoneData = GetSkeletalBoneData; input.GetSkeletalSummaryData = GetSkeletalSummaryData;
+    input.GetSkeletalBoneDataCompressed = GetSkeletalBoneDataCompressed; input.DecompressSkeletalBoneData = DecompressSkeletalBoneData;
 
     chap.GetCalibrationState = GetCalibrationState; chap.GetPlayAreaSize = GetPlayAreaSize;
-    chap.GetPlayAreaRect = GetPlayAreaRect; chap.AreBoundsVisible = AreBoundsVisible;
+    chap.GetPlayAreaRect = GetPlayAreaRect; chap.AreBoundsVisible = AreBoundsVisible; chap.GetBoundsColor = GetBoundsColor;
     chapSetup.GetWorkingPlayAreaSize = GetPlayAreaSize; chapSetup.GetWorkingPlayAreaRect = GetPlayAreaRect;
+    chapSetup.GetWorkingCollisionBoundsInfo = GetCollisionBounds; chapSetup.GetLiveCollisionBoundsInfo = GetCollisionBounds;
+    chapSetup.GetWorkingSeatedZeroPoseToRawTrackingPose = GetStandingZeroPose; chapSetup.GetWorkingStandingZeroPoseToRawTrackingPose = GetStandingZeroPose;
+    chapSetup.GetLiveSeatedZeroPoseToRawTrackingPose = GetStandingZeroPose;
     models.GetRenderModelCount = GetRenderModelCount; models.GetComponentButtonMask = GetComponentButtonMask;
     models.GetComponentStateForDevicePath = GetComponentStateForDevicePath;
     settings.GetFloat = GetFloat; settings.GetBool = GetBool; settings.GetInt32 = GetInt32; settings.GetString = GetString;
@@ -821,6 +1357,18 @@ static void build_tables(void) {
     memcpy(comp028 + at + 1, (void **)&comp + at, sizeof comp - at * sizeof(void *));
     apps.AddApplicationManifest = AddApplicationManifest; apps.IsApplicationInstalled = IsApplicationInstalled;
     apps.IdentifyApplication = IdentifyApplication; apps.GetApplicationsErrorNameFromEnum = GetApplicationsErrorNameFromEnum;
+    #define O(n) overlay.n = n;
+    O(FindOverlay) O(CreateOverlay) O(DestroyOverlay) O(GetOverlayKey) O(GetOverlayName) O(SetOverlayName) O(GetOverlayErrorNameFromEnum)
+    O(SetOverlayFlag) O(GetOverlayFlag) O(GetOverlayFlags) O(SetOverlayColor) O(GetOverlayColor) O(SetOverlayAlpha) O(GetOverlayAlpha)
+    O(SetOverlayTexelAspect) O(GetOverlayTexelAspect) O(SetOverlaySortOrder) O(GetOverlaySortOrder) O(SetOverlayWidthInMeters)
+    O(GetOverlayWidthInMeters) O(SetOverlayCurvature) O(GetOverlayCurvature) O(SetOverlayPreCurvePitch) O(GetOverlayPreCurvePitch)
+    O(SetOverlayTextureColorSpace) O(GetOverlayTextureColorSpace) O(SetOverlayTextureBounds) O(GetOverlayTextureBounds)
+    O(GetOverlayTransformType) O(SetOverlayTransformAbsolute) O(GetOverlayTransformAbsolute) O(SetOverlayTransformTrackedDeviceRelative)
+    O(GetOverlayTransformTrackedDeviceRelative) O(ShowOverlay) O(HideOverlay) O(IsOverlayVisible) O(PollNextOverlayEvent)
+    O(GetOverlayInputMethod) O(SetOverlayInputMethod) O(GetOverlayMouseScale) O(SetOverlayMouseScale) O(ComputeOverlayIntersection)
+    O(SetOverlayTexture) O(ClearOverlayTexture) O(CreateDashboardOverlay) O(IsDashboardVisible) O(IsActiveDashboardOverlay)
+    O(GetPrimaryDashboardDevice) O(ShowKeyboard) O(ShowKeyboardForOverlay) O(GetKeyboardText) O(ShowMessageOverlay)
+    #undef O
 }
 
 // ---------------------------------------------------------------- exported VR_* entry points
@@ -872,6 +1420,7 @@ static const struct { const char *name; void *table; } interfaces[] = {
     {"IVRChaperoneSetup_006", &chapSetup}, {"IVRChaperoneSetup_005", &chapSetup},
     {"IVRRenderModels_006", &models}, {"IVRRenderModels_005", &models},
     {"IVRSettings_003", &settings}, {"IVRSettings_002", &settings}, {"IVRSettings_001", &settings},
+    {"IVROverlay_026", &overlay},
     {"IVRApplications_007", &apps}, {"IVRApplications_006", &apps}, {"IVRApplications_005", &apps},
 };
 EXPORT bool VR_IsInterfaceVersionValid(const char *v) {

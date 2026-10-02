@@ -1,4 +1,6 @@
-// Drives build/libopenvr_api.dylib through LWJGL's OpenVR bindings the way Vivecraft does. Needs MacVR running (shm).
+// Drives build/libopenvr_api.dylib through LWJGL's OpenVR bindings the way Vivecraft does, against the shm in
+// VR4MAC_SHM (run.sh makes a temporary one). Also calls skeletal input, overlays, events and the hidden area mesh, so
+// the Apple Silicon JNI trampolines (jni_calls.h) for them are exercised.
 import org.lwjgl.openvr.*;
 import org.lwjgl.system.MemoryStack;
 import java.nio.*;
@@ -27,7 +29,8 @@ public class OpenVRTest {
             Files.writeString(dir.resolve("b.json"), "{\"bindings\":{\"/actions/ingame\":{\"sources\":[{\"path\":\"/user/hand/right/input/trigger\",\"mode\":\"button\",\"inputs\":{\"click\":{\"output\":\"/actions/ingame/in/key.attack\"}}},"
                 + "{\"path\":\"/user/hand/left/input/joystick\",\"mode\":\"joystick\",\"inputs\":{\"position\":{\"output\":\"/actions/ingame/in/move\"}}}]},"
                 + "\"/actions/global\":{\"poses\":[{\"output\":\"/actions/global/in/lefthand\",\"path\":\"/user/hand/left/pose/raw\"}]}}}");
-            Files.writeString(dir.resolve("m.json"), "{\"actions\":[{\"name\":\"/actions/ingame/in/key.attack\",\"type\":\"boolean\"},{\"name\":\"/actions/ingame/in/move\",\"type\":\"vector2\"},{\"name\":\"/actions/global/in/lefthand\",\"type\":\"pose\"}],"
+            Files.writeString(dir.resolve("m.json"), "{\"actions\":[{\"name\":\"/actions/ingame/in/key.attack\",\"type\":\"boolean\"},{\"name\":\"/actions/ingame/in/move\",\"type\":\"vector2\"},{\"name\":\"/actions/global/in/lefthand\",\"type\":\"pose\"},"
+                + "{\"name\":\"/actions/global/in/lefthand_anim\",\"type\":\"skeleton\",\"skeleton\":\"/skeleton/hand/left\"}],"
                 + "\"action_sets\":[{\"name\":\"/actions/ingame\"},{\"name\":\"/actions/global\"}],\"default_bindings\":[{\"controller_type\":\"oculus_touch\",\"binding_url\":\"b.json\"}]}");
             check(VRInput.VRInput_SetActionManifestPath(dir.resolve("m.json").toString()) == 0, "action manifest");
             LongBuffer set = s.mallocLong(1), act = s.mallocLong(1), pose = s.mallocLong(1);
@@ -42,6 +45,19 @@ public class OpenVRTest {
             check(VRInput.VRInput_GetPoseActionDataForNextFrame(pose.get(0), ETrackingUniverseOrigin_TrackingUniverseStanding, pd, 0) == 0 && pd.activeOrigin() == 1, "pose action -> left hand");
             InputOriginInfo oi = InputOriginInfo.calloc(s);
             check(VRInput.VRInput_GetOriginTrackedDeviceInfo(pd.activeOrigin(), oi) == 0 && oi.trackedDeviceIndex() == 1, "origin -> device 1");
+
+            LongBuffer skel = s.mallocLong(1); IntBuffer nb = s.mallocInt(1);
+            VRInput.VRInput_GetActionHandle("/actions/global/in/lefthand_anim", skel);
+            check(VRInput.VRInput_GetBoneCount(skel.get(0), nb) == 0 && nb.get(0) == 31, "skeleton: 31 bones");
+            VRBoneTransform.Buffer bones = VRBoneTransform.calloc(31, s);
+            check(VRInput.VRInput_GetSkeletalBoneData(skel.get(0), EVRSkeletalTransformSpace_VRSkeletalTransformSpace_Model,
+                  EVRSkeletalMotionRange_VRSkeletalMotionRange_WithController, bones) == 0 && bones.get(0).orientation().w() == 1, "skeletal bone data");
+            VRSkeletalSummaryData sum = VRSkeletalSummaryData.calloc(s);
+            check(VRInput.VRInput_GetSkeletalSummaryData(skel.get(0), EVRSummaryType_VRSummaryType_FromDevice, sum) == 0, "skeletal summary (index curl " + sum.flFingerCurl(1) + ")");
+            check(OpenVR.VROverlay != null && VROverlay.VROverlay_CreateOverlay("siliconxr.test", "Test", s.mallocLong(1)) == 0, "overlay");
+            check(VRSystem.VRSystem_GetHiddenAreaMesh(EVREye_Eye_Left, EHiddenAreaMeshType_k_eHiddenAreaMesh_Standard, HiddenAreaMesh.calloc(s)).unTriangleCount() > 0, "hidden area mesh");
+            VREvent ev = VREvent.calloc(s);
+            check(VRSystem.VRSystem_PollNextEvent(ev) && ev.eventType() == EVREventType_VREvent_TrackedDeviceActivated, "events");
 
             TrackedDevicePose.Buffer poses = TrackedDevicePose.calloc(64, s);
             long t0 = System.nanoTime();
