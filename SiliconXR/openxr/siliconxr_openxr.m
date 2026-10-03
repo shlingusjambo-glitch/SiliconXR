@@ -77,7 +77,7 @@ static XrPath intern(const char *s) {
 static const char *pstr(XrPath p) { return p >= 1 && p <= (XrPath)npaths ? paths[p - 1] : ""; }
 
 // ---------------------------------------------------------------- objects
-typedef struct { int hand, hp; char comp[64]; } Binding;   // hp: from the hand-interaction profile (used while that hand is tracked)
+typedef struct { int hand, hp, out; char comp[64]; } Binding;   // hp: from the hand-interaction profile (used while that hand is tracked); out: an /output/ (haptic) binding
 typedef struct { uint32_t gen; float cur[2], prev[2]; } ActionHistory;
 typedef struct Action { XrActionType type; char name[64]; XrPath sub[8]; int nsub; Binding b[32]; int nb; ActionHistory hist[3]; } Action;
 typedef struct { char name[64]; } ActionSet;
@@ -213,7 +213,7 @@ static int parse_binding(const char *path, Binding *b) {   // "/user/hand/left/i
     else if (!strncmp(path, "/user/hand/right/", 17)) b->hand = 1;
     else return 0;
     const char *c = strstr(path, "/input/");
-    if (c) c += 7; else if ((c = strstr(path, "/output/"))) c += 8; else return 0;
+    if (c) { c += 7; b->out = 0; } else if ((c = strstr(path, "/output/"))) { c += 8; b->out = 1; } else return 0;
     snprintf(b->comp, sizeof b->comp, "%s", c);
     return 1;
 }
@@ -473,7 +473,7 @@ static int enabled(const char *name) { for (size_t i = 0; i < NEXTS; i++) if (!s
 static XrResult XRAPI_CALL xrEnumerateApiLayerProperties_(uint32_t cap, uint32_t *n, XrApiLayerProperties *p) { (void)cap; (void)p; *n = 0; return XR_SUCCESS; }
 static XrResult XRAPI_CALL xrEnumerateInstanceExtensionProperties_(const char *layer, uint32_t cap, uint32_t *n, XrExtensionProperties *p) {
     (void)layer;
-    FILL_ARRAY(cap, n, p, (uint32_t)NEXTS, { strcpy(p[i_].extensionName, exts[i_].name); p[i_].extensionVersion = exts[i_].ver; });
+    FILL_ARRAY(cap, n, p, (uint32_t)NEXTS, { p[i_].type = XR_TYPE_EXTENSION_PROPERTIES; strcpy(p[i_].extensionName, exts[i_].name); p[i_].extensionVersion = exts[i_].ver; });
     return XR_SUCCESS;
 }
 
@@ -506,10 +506,11 @@ static XrResult XRAPI_CALL xrCreateInstance_(const XrInstanceCreateInfo *ci, XrI
 }
 static XrResult XRAPI_CALL xrDestroyInstance_(XrInstance i) { (void)i; nsugg = 0; return XR_SUCCESS; }   // suggestions are per instance
 static XrResult XRAPI_CALL xrGetInstanceProperties_(XrInstance i, XrInstanceProperties *p) {
-    (void)i; p->runtimeVersion = XR_MAKE_VERSION(1, 0, 0); strcpy(p->runtimeName, "SiliconXR"); return XR_SUCCESS;
+    (void)i; p->runtimeVersion = XR_MAKE_VERSION(1, 0, 1); strcpy(p->runtimeName, "SiliconXR"); return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrPollEvent_(XrInstance i, XrEventDataBuffer *e) {
     (void)i;
+    if (!e || e->type != XR_TYPE_EVENT_DATA_BUFFER) return XR_ERROR_VALIDATION_FAILURE;   // the buffer type is the readiness marker
     Session *s = theSession;
     if (s && s->running && !s->exitRequested) {   // dashboard open on the Mac side = app loses input focus
         int focused = !shm->input_blocked;
@@ -608,6 +609,7 @@ static XrResult XRAPI_CALL xrEnumerateViewConfigurationViews_(XrInstance i, XrSy
     (void)i; (void)id;
     if (t != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
     FILL_ARRAY(cap, n, v, 2, {
+        v[i_].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
         v[i_].recommendedImageRectWidth = eye_w(); v[i_].recommendedImageRectHeight = eye_h();
         v[i_].maxImageRectWidth = 4096; v[i_].maxImageRectHeight = 4096;
         v[i_].recommendedSwapchainSampleCount = 1; v[i_].maxSwapchainSampleCount = 1; });
@@ -622,7 +624,11 @@ static XrResult XRAPI_CALL xrConvertTimespecTimeToTimeKHR_(XrInstance i, const s
     (void)i; *t = (XrTime)((int64_t)ts->tv_sec * 1000000000LL + ts->tv_nsec) + qpcOffsetNs; return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrConvertTimeToTimespecTimeKHR_(XrInstance i, XrTime t, struct timespec *ts) {
-    (void)i; int64_t ns = (int64_t)t - qpcOffsetNs; ts->tv_sec = ns / 1000000000LL; ts->tv_nsec = ns % 1000000000LL; return XR_SUCCESS;
+    (void)i;
+    int64_t ns = (int64_t)t - qpcOffsetNs;
+    ts->tv_sec = ns / 1000000000LL; ts->tv_nsec = ns % 1000000000LL;
+    if (ts->tv_nsec < 0) { ts->tv_sec--; ts->tv_nsec += 1000000000L; }   // times before the offset base still need 0 <= nsec < 1e9
+    return XR_SUCCESS;
 }
 
 // ---------------------------------------------------------------- session
@@ -661,7 +667,7 @@ static XrResult XRAPI_CALL xrBeginSession_(XrSession h, const XrSessionBeginInfo
 static XrResult XRAPI_CALL xrEndSession_(XrSession h) {
     Session *s = (Session *)h;
     s->running = 0;
-    push_state(XR_SESSION_STATE_IDLE); push_state(XR_SESSION_STATE_EXITING);
+    push_state(XR_SESSION_STATE_IDLE);   // STOPPING -> IDLE only; EXITING is pushed when the runtime wants teardown, never here
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrRequestExitSession_(XrSession h) {
@@ -1030,6 +1036,7 @@ static XrResult composite(Session *s, const XrFrameEndInfo *fi, const XrComposit
         if (vis == XR_EYE_VISIBILITY_LEFT) eyes = 1; else if (vis == XR_EYE_VISIBILITY_RIGHT) eyes = 2;
         if (type == L_CYLINDER && (p[0] <= 0 || p[1] <= 0 || p[2] <= 0)) continue;
         if (type == L_QUAD && (p[0] <= 0 || p[1] <= 0)) continue;
+        if (type == L_EQUIRECT && !(p[2] > p[3])) continue;   // upper must exceed lower: 1/(upper-lower) is NaN/inf otherwise
         int blend = l->layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
                     ? (l->layerFlags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT ? 2 : 1) : 0;
         const XrCompositionLayerColorScaleBiasKHR *cb = scale_bias(l);
@@ -1215,6 +1222,11 @@ static XrResult XRAPI_CALL xrDestroySwapchain_(XrSwapchain h) {
 }
 static XrResult XRAPI_CALL xrEnumerateSwapchainImages_(XrSwapchain h, uint32_t cap, uint32_t *n, XrSwapchainImageBaseHeader *imgs) {
     Swapchain *sc = find_sc(h);
+    if (cap > 0) {   // every element must be the Metal image struct, checked before any capacity handling
+        if (!imgs) return XR_ERROR_VALIDATION_FAILURE;
+        XrSwapchainImageMetalKHR *m = (XrSwapchainImageMetalKHR *)imgs;
+        for (uint32_t i = 0; i < cap; i++) if (m[i].type != XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR) return XR_ERROR_VALIDATION_FAILURE;
+    }
     XrSwapchainImageMetalKHR *d = (XrSwapchainImageMetalKHR *)imgs;
     FILL_ARRAY(cap, n, d, (uint32_t)sc->count, d[i_].texture = sc->img[i_]);
     return XR_SUCCESS;
@@ -1357,7 +1369,7 @@ static XrResult XRAPI_CALL xrEnumerateBoundSourcesForAction_(XrSession h, const 
     for (int i = 0; i < a->nb; i++) if (live(s, &a->b[i])) b[nb++] = &a->b[i];
     char buf[160];
     FILL_ARRAY(cap, n, out, nb, {
-        snprintf(buf, sizeof buf, "/user/hand/%s/input/%s", b[i_]->hand ? "right" : "left", b[i_]->comp);
+        snprintf(buf, sizeof buf, "/user/hand/%s/%s/%s", b[i_]->hand ? "right" : "left", b[i_]->out ? "output" : "input", b[i_]->comp);
         out[i_] = intern(buf); });
     return XR_SUCCESS;
 }
@@ -1570,16 +1582,16 @@ static XrResult XRAPI_CALL xrGetSwapchainStateFB_(XrSwapchain h, XrSwapchainStat
     f->flags = sc->fovFlags; f->profile = sc->fovProfile;
     return XR_SUCCESS;
 }
+static const XrColorSpaceFB colorSpaces[] = {XR_COLOR_SPACE_QUEST_FB, XR_COLOR_SPACE_REC709_FB, XR_COLOR_SPACE_UNMANAGED_FB};
 static XrResult XRAPI_CALL xrEnumerateColorSpacesFB_(XrSession h, uint32_t cap, uint32_t *n, XrColorSpaceFB *cs) {
     (void)h;
-    static const XrColorSpaceFB supported[] = {XR_COLOR_SPACE_QUEST_FB, XR_COLOR_SPACE_REC709_FB, XR_COLOR_SPACE_UNMANAGED_FB};
-    FILL_ARRAY(cap, n, cs, 3, cs[i_] = supported[i_]);
+    FILL_ARRAY(cap, n, cs, 3, cs[i_] = colorSpaces[i_]);
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrSetColorSpaceFB_(XrSession h, const XrColorSpaceFB cs) {
     (void)h;
-    if (cs < XR_COLOR_SPACE_UNMANAGED_FB || cs > XR_COLOR_SPACE_ADOBE_RGB_FB) return XR_ERROR_COLOR_SPACE_UNSUPPORTED_FB;
-    return XR_SUCCESS;
+    for (size_t i = 0; i < sizeof colorSpaces / sizeof *colorSpaces; i++) if (cs == colorSpaces[i]) return XR_SUCCESS;
+    return XR_ERROR_COLOR_SPACE_UNSUPPORTED_FB;   // the stream is always Quest colorspace; anything else must fall back
 }
 
 static XrResult XRAPI_CALL xrSetDebugUtilsObjectNameEXT_(XrInstance i, const XrDebugUtilsObjectNameInfoEXT *n) { (void)i; (void)n; return XR_SUCCESS; }

@@ -144,7 +144,7 @@ static void fill_velocities(TrackedDevicePose_t *p, int n) {   // finite differe
 
 // ---------------------------------------------------------------- input: manifest + oculus_touch bindings
 enum { MODE_BUTTON, MODE_TRIGGER, MODE_JOYSTICK, MODE_TOGGLE, MODE_SCROLL };
-typedef struct { char name[128]; char type[16]; int hand, isAim; float x, y, px, py; int state, prevState, origin; } Action;   // hand: pose/haptic actions
+typedef struct { char name[128]; char type[16]; int hand, isAim; float x, y, px, py; int state, prevState, origin; int isScroll; } Action;   // hand: pose/haptic actions
 typedef struct { int set, action, hand, mode; char comp[24], input[16]; } Binding;
 typedef struct { int set, action, hand[2]; char comp[2][24]; } Chord;
 static Action actions[512]; static int nactions;
@@ -216,6 +216,7 @@ static void load_bindings(NSString *file) {
                 if (a < 0 || nbinds == 1024) continue;
                 Binding *b = &binds[nbinds++];
                 *b = (Binding){.set = set, .action = a, .hand = hand, .mode = m};
+                if (m == MODE_SCROLL) actions[a].isScroll = 1;
                 snprintf(b->comp, 24, "%s", comp_of(path).UTF8String); snprintf(b->input, 16, "%s", in.UTF8String);
             }
         }
@@ -332,6 +333,7 @@ static EVRInputError UpdateActionState(VRActiveActionSet_t *s, uint32_t size, ui
             } else on = c;
         }
         if (on || fabsf(x) > fabsf(a->x) || fabsf(y) > fabsf(a->y)) a->origin = b->hand + 1;
+        if (b->mode == MODE_SCROLL) a->isScroll = 1;   // sticky: GetAnalogActionData stays O(1) per call
         a->state |= on;
         if (fabsf(x) > fabsf(a->x)) a->x = x;
         if (fabsf(y) > fabsf(a->y)) a->y = y;
@@ -379,8 +381,7 @@ static EVRInputError GetAnalogActionData(VRActionHandle_t h, InputAnalogActionDa
     if (!a) return EVRInputError_VRInputError_InvalidHandle;
     memset(d, 0, size);
     if (!restrict_ok(a, r)) { d->bActive = 1; return 0; }
-    int scroll = 0;
-    for (int i = 0; i < nbinds; i++) if (binds[i].action == (int)h - 1 && binds[i].mode == MODE_SCROLL) scroll = 1;
+    int scroll = a->isScroll;
     d->bActive = 1; d->activeOrigin = a->origin; d->x = a->x; d->y = a->y;
     d->deltaX = scroll ? a->x : a->x - a->px; d->deltaY = scroll ? a->y : a->y - a->py;   // scroll: ticks this update
     return EVRInputError_VRInputError_None;
@@ -444,9 +445,12 @@ static Quat q_axis(float ax, float ay, float az, float angle) { float s = sinf(a
 /// Rotation whose -Z points along `dir` and whose +Y is as close to `up` as possible.
 static Quat q_look(V3 dir, V3 up) {
     float l = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    if (!(l > 1e-9f)) return (Quat){0, 0, 0, 1};
     V3 z = {-dir.x / l, -dir.y / l, -dir.z / l};
     V3 x = {up.y * z.z - up.z * z.y, up.z * z.x - up.x * z.z, up.x * z.y - up.y * z.x};
-    l = sqrtf(x.x * x.x + x.y * x.y + x.z * x.z); x = (V3){x.x / l, x.y / l, x.z / l};
+    l = sqrtf(x.x * x.x + x.y * x.y + x.z * x.z);
+    if (!(l > 1e-9f)) return (Quat){0, 0, 0, 1};
+    x = (V3){x.x / l, x.y / l, x.z / l};
     V3 y = {z.y * x.z - z.z * x.y, z.z * x.x - z.x * x.z, z.x * x.y - z.y * x.x};
     float t = x.x + y.y + z.z, s;
     if (t > 0) { s = sqrtf(t + 1) * 2; return (Quat){(y.z - z.y) / s, (z.x - x.z) / s, (x.y - y.x) / s, s / 4}; }
@@ -655,6 +659,7 @@ static void GetProjectionRaw(EVREye e, float *l, float *r, float *t, float *b) {
     *l = tanf(f.left); *r = tanf(f.right); *t = tanf(f.down); *b = tanf(f.up);   // OpenVR's "top" is the down tangent
 }
 static HmdMatrix44_t GetProjectionMatrix(EVREye e, float n, float fa) {   // OpenGL clip space, like xr_linear.h
+    if (!(fa > n) || !(n > 0)) return (HmdMatrix44_t){{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, -1, -2 * n}, {0, 0, -1, 0}}};
     VR4Fov f = eye_fov(e);
     float L = tanf(f.left), R = tanf(f.right), U = tanf(f.up), D = tanf(f.down), W = R - L, H = U - D;
     return (HmdMatrix44_t){{{2 / W, 0, (R + L) / W, 0}, {0, 2 / H, (U + D) / H, 0},
@@ -984,6 +989,7 @@ static EVRCompositorError Submit(EVREye eye, Texture_t *tex, VRTextureBounds_t *
     glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
     if (tw <= 0 || th <= 0) return EVRCompositorError_VRCompositorError_InvalidTexture;
     VRTextureBounds_t b = bounds ? *bounds : (VRTextureBounds_t){0, 0, 1, 1};
+    if (!isfinite(b.uMin) || !isfinite(b.uMax) || !isfinite(b.vMin) || !isfinite(b.vMax)) return EVRCompositorError_VRCompositorError_InvalidBounds;
     // GL textures: v = 0 is the top of the image, i.e. the last GL row. Inverted bounds flip it back.
     GLint sx0 = (GLint)(b.uMin * tw), sx1 = (GLint)(b.uMax * tw), sy0 = (GLint)((1 - b.vMax) * th), sy1 = (GLint)((1 - b.vMin) * th);
     uint32_t w = (uint32_t)abs(sx1 - sx0), h = (uint32_t)abs(sy1 - sy0);
@@ -1189,7 +1195,8 @@ static EVROverlayError SetOverlayName(VROverlayHandle_t h, char *name) { OV(h); 
 static char *GetOverlayErrorNameFromEnum(EVROverlayError e) {
     switch ((int)e) {
     case 0: return "VROverlayError_None"; case 10: return "VROverlayError_UnknownOverlay"; case 13: return "VROverlayError_OverlayLimitExceeded";
-    case 17: return "VROverlayError_KeyInUse"; case 18: return "VROverlayError_WrongTransformType"; case 23: return "VROverlayError_RequestFailed";
+    case 17: return "VROverlayError_KeyInUse"; case 18: return "VROverlayError_WrongTransformType"; case 19: return "VROverlayError_InvalidTrackedDevice";
+    case 20: return "VROverlayError_InvalidParameter"; case 23: return "VROverlayError_RequestFailed"; case 24: return "VROverlayError_InvalidTexture";
     default: return "VROverlayError_Unknown";
     }
 }
@@ -1214,18 +1221,22 @@ static EVROverlayError SetOverlayTextureBounds(VROverlayHandle_t h, VRTextureBou
 static EVROverlayError GetOverlayTextureBounds(VROverlayHandle_t h, VRTextureBounds_t *b) { OV(h); *b = o->bounds; return 0; }
 static EVROverlayError GetOverlayTransformType(VROverlayHandle_t h, VROverlayTransformType *t) { OV(h); *t = o->ttype; return 0; }
 static EVROverlayError SetOverlayTransformAbsolute(VROverlayHandle_t h, ETrackingUniverseOrigin origin, HmdMatrix34_t *m) {
-    OV(h); o->ttype = VROverlayTransformType_VROverlayTransform_Absolute; o->origin = origin; o->xf = *m; return 0;
+    OV(h); if (!m) return EVROverlayError_VROverlayError_InvalidParameter;
+    o->ttype = VROverlayTransformType_VROverlayTransform_Absolute; o->origin = origin; o->xf = *m; return 0;
 }
 static EVROverlayError GetOverlayTransformAbsolute(VROverlayHandle_t h, ETrackingUniverseOrigin *origin, HmdMatrix34_t *m) {
     OV(h); if (o->ttype != VROverlayTransformType_VROverlayTransform_Absolute) return EVROverlayError_VROverlayError_WrongTransformType;
+    if (!origin || !m) return EVROverlayError_VROverlayError_InvalidParameter;
     *origin = o->origin; *m = o->xf; return 0;
 }
 static EVROverlayError SetOverlayTransformTrackedDeviceRelative(VROverlayHandle_t h, TrackedDeviceIndex_t d, HmdMatrix34_t *m) {
     OV(h); if (d > 2) return EVROverlayError_VROverlayError_InvalidTrackedDevice;
+    if (!m) return EVROverlayError_VROverlayError_InvalidParameter;
     o->ttype = VROverlayTransformType_VROverlayTransform_TrackedDeviceRelative; o->device = d; o->xf = *m; return 0;
 }
 static EVROverlayError GetOverlayTransformTrackedDeviceRelative(VROverlayHandle_t h, TrackedDeviceIndex_t *d, HmdMatrix34_t *m) {
     OV(h); if (o->ttype != VROverlayTransformType_VROverlayTransform_TrackedDeviceRelative) return EVROverlayError_VROverlayError_WrongTransformType;
+    if (!d || !m) return EVROverlayError_VROverlayError_InvalidParameter;
     *d = o->device; *m = o->xf; return 0;
 }
 static EVROverlayError ShowOverlay(VROverlayHandle_t h) { OV(h); o->visible = 1; return 0; }

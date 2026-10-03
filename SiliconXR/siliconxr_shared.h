@@ -9,7 +9,8 @@
 
 /// Seqlock read of the Mac app's latest tracking sample and hand joints. Returns 1 if the sample changed since *seq.
 static inline int sxr_read(VR4Shm *shm, VR4Tracking *t, VR4HandJoints j[2], uint32_t *seq) {
-    for (int tries = 0; shm && tries < 100; tries++) {
+    if (!shm || !t || !j || !seq) return 0;
+    for (int tries = 0; tries < 100; tries++) {
         uint32_t s1 = shm->track_seq; vr4_fence();
         if (s1 & 1) continue;
         VR4Tracking tt = shm->track; VR4HandJoints jj[2] = {shm->hand_joints[0], shm->hand_joints[1]}; vr4_fence();
@@ -27,6 +28,8 @@ static inline void sxr_haptic(VR4Shm *shm, int hand, float amp, float dur, float
     static dispatch_queue_t q; static dispatch_once_t once; static uint64_t last;
     dispatch_once(&once, ^{ q = dispatch_queue_create("SiliconXR.haptics", DISPATCH_QUEUE_SERIAL); });
     if (!shm || hand < 0 || hand > 1) return;
+    if (!(delay >= 0)) delay = 0; else if (delay > 60) delay = 60;   // clamp: int64 ns must not overflow
+    if (!(dur >= 0)) dur = 0; else if (dur > 60) dur = 60;
     VR4Haptics h = {(uint8_t)hand, amp < 0 ? 0 : amp > 1 ? 1 : amp, dur, freq > 0 ? freq : 0};
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay > 0 ? (int64_t)(delay * 1e9) : 0), q, ^{
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -72,6 +75,7 @@ static inline void sxr_mask_ring(float out[SXR_MASK_N][2], float rect[SXR_MASK_N
 /// Triangles (counter-clockwise, 3 points each) of the hidden corners (hidden = 1) or of the visible area (hidden = 0).
 /// Returns the triangle count; tri must hold 2 * SXR_MASK_N triangles.
 static inline int sxr_mask_triangles(int hidden, float tri[][3][2]) {
+    if (!tri) return 0;
     float in[SXR_MASK_N][2], out[SXR_MASK_N][2]; int n = 0;
     sxr_mask_ring(in, out);
     for (int k = 0; k < SXR_MASK_N; k++) {

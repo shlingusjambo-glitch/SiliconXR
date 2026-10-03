@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #define VR4_PORT_TCP 9945      // Mac app listens here
-#define VR4_PORT_DISCOVERY 9944 // was: Mac broadcast "VR4MAC 9945" here every second (disabled 26112d5; Wi-Fi pairing needs another way)
+#define VR4_PORT_DISCOVERY 9944 // Quest asks "VR4MAC?" here ~1/s; the Mac answers "VR4MAC 9945" to that sender only (never broadcasts)
 
 enum { VR4_HELLO = 1, VR4_CONFIG = 2, VR4_TRACKING = 3, VR4_VIDEO = 4, VR4_HAPTICS = 5, VR4_AUDIO = 6, VR4_REQUEST_IDR = 7, VR4_MIC = 8, VR4_STATUS = 9 };
 // VR4_STATUS C->S, about once a second (optional: older Macs ignore unknown types, older clients never send it): UTF-8 JSON,

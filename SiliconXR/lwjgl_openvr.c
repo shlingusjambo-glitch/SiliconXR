@@ -11,34 +11,44 @@
 typedef void *E; typedef void *C;
 
 JNI(VRSystem_nVRSystem_1GetProjectionMatrix)(E e, C c, int32_t eye, float n, float f, int64_t fn, int64_t r) {
+    if (!P(r) || !P(fn)) return;
     HmdMatrix44_t m = ((HmdMatrix44_t (*)(EVREye, float, float))P(fn))((EVREye)eye, n, f); memcpy(P(r), &m, sizeof m);
 }
 JNI(VRSystem_nVRSystem_1GetEyeToHeadTransform)(E e, C c, int32_t eye, int64_t fn, int64_t r) {
+    if (!P(r) || !P(fn)) return;
     HmdMatrix34_t m = ((HmdMatrix34_t (*)(EVREye))P(fn))((EVREye)eye); memcpy(P(r), &m, sizeof m);
 }
 JNI(VRSystem_nVRSystem_1GetSeatedZeroPoseToStandingAbsoluteTrackingPose)(E e, C c, int64_t fn, int64_t r) {
+    if (!P(r) || !P(fn)) return;
     HmdMatrix34_t m = ((HmdMatrix34_t (*)(void))P(fn))(); memcpy(P(r), &m, sizeof m);
 }
 JNI(VRSystem_nVRSystem_1GetRawZeroPoseToStandingAbsoluteTrackingPose)(E e, C c, int64_t fn, int64_t r) {
+    if (!P(r) || !P(fn)) return;
     HmdMatrix34_t m = ((HmdMatrix34_t (*)(void))P(fn))(); memcpy(P(r), &m, sizeof m);
 }
 JNI(VRSystem_nVRSystem_1GetMatrix34TrackedDeviceProperty)(E e, C c, int32_t dev, int32_t prop, int64_t err, int64_t fn, int64_t r) {
+    if (!P(r) || !P(fn)) return;
     HmdMatrix34_t m = ((HmdMatrix34_t (*)(TrackedDeviceIndex_t, ETrackedDeviceProperty, ETrackedPropertyError *))P(fn))((TrackedDeviceIndex_t)dev, (ETrackedDeviceProperty)prop, P(err));
     memcpy(P(r), &m, sizeof m);
 }
 JNI(VRSystem_nVRSystem_1GetHiddenAreaMesh)(E e, C c, int32_t eye, int32_t type, int64_t fn, int64_t r) {
+    if (!P(r) || !P(fn)) return;
     HiddenAreaMesh_t m = ((HiddenAreaMesh_t (*)(EVREye, EHiddenAreaMeshType))P(fn))((EVREye)eye, (EHiddenAreaMeshType)type); memcpy(P(r), &m, sizeof m);
 }
 JNI(VRChaperone_nVRChaperone_1SetSceneColor)(E e, C c, int64_t color, int64_t fn) {
+    if (!P(color) || !P(fn)) return;
     ((void (*)(HmdColor_t))P(fn))(*(HmdColor_t *)P(color));
 }
 JNI(VRCompositor_nVRCompositor_1GetCurrentFadeColor)(E e, C c, uint8_t bg, int64_t fn, int64_t r) {
+    if (!P(r) || !P(fn)) return;
     HmdColor_t m = ((HmdColor_t (*)(bool))P(fn))(bg); memcpy(P(r), &m, sizeof m);
 }
 JNI(VROverlay_nVROverlay_1SetKeyboardPositionForOverlay)(E e, C c, int64_t overlay, int64_t rect, int64_t fn) {
+    if (!P(rect) || !P(fn)) return;
     ((void (*)(VROverlayHandle_t, HmdRect2_t))P(fn))((VROverlayHandle_t)overlay, *(HmdRect2_t *)P(rect));
 }
 __attribute__((visibility("default"))) int32_t Java_org_lwjgl_openvr_VROverlay_nVROverlay_1GetTransformForOverlayCoordinates(E e, C c, int64_t overlay, int32_t origin, int64_t coords, int64_t out, int64_t fn) {
+    if (!P(coords) || !P(out) || !P(fn)) return 0;
     return ((EVROverlayError (*)(VROverlayHandle_t, ETrackingUniverseOrigin, HmdVector2_t, HmdMatrix34_t *))P(fn))((VROverlayHandle_t)overlay, (ETrackingUniverseOrigin)origin, *(HmdVector2_t *)P(coords), P(out));
 }
 
